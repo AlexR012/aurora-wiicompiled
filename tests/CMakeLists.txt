@@ -64,12 +64,13 @@ gtest_discover_tests(input_tests)
 
 add_executable(pad_adapter_tests
   pad_adapter_test.cpp
+  pad_mapping_test.cpp
 )
 target_include_directories(pad_adapter_tests PRIVATE
   ../include
   ../lib
 )
-target_link_libraries(pad_adapter_tests PRIVATE aurora::pad gtest gtest_main)
+target_link_libraries(pad_adapter_tests PRIVATE aurora::pad absl::flat_hash_map gtest gtest_main)
 if (AURORA_ENABLE_GX)
   target_link_libraries(pad_adapter_tests PRIVATE aurora::gx aurora::vi)
   if (CMAKE_SYSTEM_NAME STREQUAL "Linux")

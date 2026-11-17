@@ -1258,6 +1258,9 @@ void PADSerializeMappings() {
 
   for (auto& controller : aurora::gamepad::g_GameControllers | std::views::values) {
     EnsureMappingLoaded(&controller);
+    if (!controller.m_mappingLoaded) {
+      continue;
+    }
     const auto filePath =
         basePath / fmt::format("{}_{:04X}_{:04X}.controller", aurora::gamepad::controller_name(controller.m_index),
                                controller.m_vid, controller.m_pid);
