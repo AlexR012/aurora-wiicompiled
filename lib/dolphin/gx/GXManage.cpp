@@ -387,6 +387,7 @@ void __GXSetVCD() {
   u32 reg = (nCols) | (nNrm << 2) | (nTex << 4);
   GX_WRITE_XF_REG(8, reg);
   __gx->bpSent = 0;
+  __GXRecordVtxDesc();
 
   // Calculate vertex data limit for flush prim
   if (__gx->vNum != 0) {
@@ -429,6 +430,7 @@ void __GXSetVAT() {
       GX_WRITE_SOME_REG4(8, i | 0x70, __gx->vatA[i], i - 12);
       GX_WRITE_SOME_REG4(8, i | 0x80, __gx->vatB[i], i - 12);
       GX_WRITE_SOME_REG4(8, i | 0x90, __gx->vatC[i], i - 12);
+      __GXRecordVtxAttrFmt(i);
     }
   }
   __gx->dirtyVAT = 0;

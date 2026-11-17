@@ -6,6 +6,7 @@
 #include <span>
 #include <utility>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace aurora::gfx::detail {
@@ -102,6 +103,8 @@ template <typename T>
 Range push_uniform(const T& data) {
   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
 }
+uint64_t recording_upload_epoch() noexcept;
+std::optional<Range> try_push_uber_state(std::span<const uint8_t> data) noexcept;
 Range push_storage(const uint8_t* data, size_t length);
 template <typename T>
 Range push_storage(ArrayRef<T> data) {

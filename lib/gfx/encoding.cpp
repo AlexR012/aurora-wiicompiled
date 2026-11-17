@@ -366,7 +366,8 @@ void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& fra
 bool needs_staging_copy(const FramePacket& frame, const FrameOp& op) {
   const auto& highWater = op.highWater;
   if (highWater.verts > frame.copied.verts || highWater.uniforms > frame.copied.uniforms ||
-      highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage) {
+      highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage ||
+      highWater.uberStates > frame.copied.uberStates) {
     return true;
   }
   if constexpr (UseTextureBuffer) {
@@ -388,6 +389,8 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
   copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, res.indexBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset,
                             res.storageBuffer);
+  copy_staging_buffer_range(cmd, frame, frame.copied.uberStates, highWater.uberStates, UberStateStagingOffset,
+                            res.uberStateBuffer);
 
   if constexpr (UseTextureBuffer) {
     for (size_t i = frame.copied.textureUploadCount; i < op.textureUploads.size(); ++i) {
@@ -422,6 +425,7 @@ void encode_full_staging_copy(wgpu::CommandEncoder& cmd, FramePacket& frame) {
       .uniforms = static_cast<uint32_t>(frame.uniforms.size()),
       .indices = static_cast<uint32_t>(frame.indices.size()),
       .storage = static_cast<uint32_t>(frame.storage.size()),
+      .uberStates = static_cast<uint32_t>(frame.uberStates.size()),
       .textureUpload = static_cast<uint32_t>(frame.textureUpload.size()),
       .textureUploadCount = frame.textureUploads.size(),
   };

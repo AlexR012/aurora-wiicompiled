@@ -4,6 +4,13 @@
 
 #include "../../gx/fifo.hpp"
 
+extern "C" {
+void __GXRecordVtxDesc();
+void __GXRecordVtxAttrFmt(u8 fmt);
+void __GXInvalidateVtxState();
+void __GXInvalidateVtxCPReg(u8 reg);
+}
+
 #define GX_WRITE_U8(ub) aurora::gx::fifo::write_u8(static_cast<uint8_t>(ub))
 #define GX_WRITE_DATA(data, length) aurora::gx::fifo::write_data(data, length)
 #define GX_WRITE_U16(us) aurora::gx::fifo::write_u16(static_cast<uint16_t>(us))
@@ -58,6 +65,7 @@
 // GX_WRITE_SOME_REG4: generic CP register write (VCD, VAT, matrix index)
 #define GX_WRITE_SOME_REG4(a, b, c, addr)                                                                              \
   do {                                                                                                                 \
+    __GXInvalidateVtxCPReg(static_cast<u8>(b));                                                                         \
     GX_WRITE_U8(a);                                                                                                    \
     GX_WRITE_U8(b);                                                                                                    \
     GX_WRITE_U32(c);                                                                                                   \
@@ -79,6 +87,7 @@
 
 #define GX_WRITE_CP_REG(addr, value)  \
   do {                                \
+  __GXInvalidateVtxCPReg(static_cast<u8>(addr)); \
   GX_WRITE_U8(GX_LOAD_CP_REG);        \
   GX_WRITE_U8(addr);                  \
   GX_WRITE_U32(value);                \
@@ -164,6 +173,16 @@ struct __GXData_struct {
                     // bit 2: gen mode
                     // bit 3: VCD
                     // bit 4: VAT
+  u32 sentVcdLo;
+  u32 sentVcdHi;
+  u32 sentVatA[8];
+  u32 sentVatB[8];
+  u32 sentVatC[8];
+  GXAttrType sentNrmType;
+  u8 sentHasNrms;
+  u8 sentHasBiNrms;
+  u8 sentVcdValid;
+  u8 sentVatValid;
 };
 
 extern __GXData_struct* __gx;

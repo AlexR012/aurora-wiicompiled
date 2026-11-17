@@ -41,6 +41,17 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLa
 PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout, bool blocking = false);
 PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
 
+enum class PipelineBuildState : uint8_t { Missing, Pending, Ready, Failed };
+PipelineBuildState pipeline_build_state(PipelineRef ref) noexcept;
+bool try_get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) noexcept;
+bool get_pipeline_ready(PipelineRef ref, CompiledPipeline& pipeline);
+PipelineRef find_deferred_specialization(const gx::PipelineConfig&, const RenderTargetLayout&);
+PipelineRef find_uber_pipeline(const gx::PipelineConfig&, const RenderTargetLayout&);
+namespace testing {
+using PipelineCreateHook = bool (*)(PipelineRef, bool generic);
+// Install only while no jobs are running. The hook runs before the real creator.
+void set_pipeline_create_hook(PipelineCreateHook) noexcept;
+}
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
 
 // While alive, get_pipeline on this thread waits for pending pipelines instead of skipping the draw.

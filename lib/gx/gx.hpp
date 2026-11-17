@@ -80,11 +80,13 @@ struct DrawImmediateData {
   u32 vtxStart = 0;
   u32 currentPnMtx = 0;
   u32 fogRangeBase = 0;
-  u32 _pad = 0;
+  u32 uberStateOffset = 0;
   std::array<u32, MaxIndexAttr> arrayStart{};
 };
 static_assert(std::has_unique_object_representations_v<DrawImmediateData>);
 static_assert(sizeof(DrawImmediateData) == 64);
+static_assert(offsetof(DrawImmediateData, uberStateOffset) == 12);
+static_assert(MaxUniformSize <= UINT16_MAX);
 
 extern wgpu::BindGroup g_emptyTextureBindGroup;
 
@@ -553,6 +555,20 @@ struct PipelineOptions;
 struct GXBindGroups {
   gfx::BindGroupRef textureBindGroup;
 };
+struct UniformOffsets {
+  static constexpr u32 Absent = UINT32_MAX;
+  u32 projection, postex, nrm;
+  std::array<u32, MaxTevRegs> tevreg;
+  u32 lights, lightState;
+  std::array<u32, MaxColorChannels> ambient, material;
+  std::array<u32, MaxKColors> kcolor;
+  u32 postmtx, fog, ztexture, indmtx;
+  std::array<u32, MaxTexCoord> texcoordScale;
+  std::array<u32, MaxTextures> texSizeBias;
+  u32 end;
+};
+static_assert(std::has_unique_object_representations_v<UniformOffsets>);
+
 // Output info from shader generation
 struct ShaderInfo {
   std::bitset<MaxTexCoord> sampledTexCoords;
@@ -566,6 +582,7 @@ struct ShaderInfo {
   std::bitset<MaxIndStages> usedIndStages;
   std::bitset<MaxTextures> sampledIndTextures;
   std::bitset<MaxIndTexMtxs> usedIndTexMtxs;
+  UniformOffsets offsets{};
   u32 uniformSize = 0;
   bool usesFog : 1 = false;
   bool usesZTexture : 1 = false;

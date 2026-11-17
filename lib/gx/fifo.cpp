@@ -12,6 +12,8 @@
 
 #include <tracy/Tracy.hpp>
 
+extern "C" void __GXInvalidateVtxState();
+
 namespace aurora::gx::fifo {
 namespace detail {
 uint8_t* sBufferData = nullptr;
@@ -133,6 +135,7 @@ ProcessingMode processing_mode() noexcept { return kProcessingMode; }
 
 void init() {
   stop_worker();
+  __GXInvalidateVtxState();
 
   constexpr uint32_t initialCapacity = 64 * 1024;
   free(detail::sBufferData);
@@ -301,6 +304,7 @@ void clear_buffer() {
   const uint64_t processed = sProcessed.load(std::memory_order_acquire);
   AURORA_ASSERT(sPublished.load(std::memory_order_acquire) == processed,
                 "fifo::clear_buffer: published commands are still pending");
+  __GXInvalidateVtxState();
   std::lock_guard lock{sBufferMutex};
   sStreamBase = processed;
   detail::sBufferSize = 0;

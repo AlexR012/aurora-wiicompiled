@@ -24,6 +24,7 @@ struct StagingHighWater {
   uint32_t uniforms = 0;
   uint32_t indices = 0;
   uint32_t storage = 0;
+  uint32_t uberStates = 0;
   uint32_t textureUpload = 0;
   size_t textureUploadCount = 0;
 };
@@ -212,6 +213,7 @@ struct FramePacket {
   ByteBuffer uniforms;
   ByteBuffer indices;
   ByteBuffer storage;
+  ByteBuffer uberStates;
   ByteBuffer textureUpload;
   wgpu::CommandEncoder encoder;
   std::vector<AfterSubmitCallback> afterSubmitCallbacks;

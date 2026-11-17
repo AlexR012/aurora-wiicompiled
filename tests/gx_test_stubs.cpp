@@ -17,12 +17,16 @@
 #include "gx/pipeline.hpp"
 #include "gx/frame_interpolation.hpp"
 #include "gx/shader_info.hpp"
+#include "gx/ubershader.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
 
 #include <atomic>
 #include <cstdio>
 #include <fmt/format.h>
+#if defined(MKW_GX_COPY_TESTING)
+#include "gx_sync_support/copy_observation.h"
+#endif
 
 // --- aurora::g_config ---
 namespace aurora {
@@ -250,7 +254,10 @@ std::atomic<uint32_t> offscreenHeight{0};
 
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
-                       GXPixelFmt sourceFormat, const ResolveOptions&) {
+                       GXPixelFmt sourceFormat, const ResolveOptions& options) {
+#if defined(MKW_GX_COPY_TESTING)
+  testing::observe_copy(texture, rect, clearColor, clearAlpha, clearDepth, resolveFormat, options);
+#endif
   testing::resolvePassCount.fetch_add(1, std::memory_order_release);
 }
 void begin_offscreen(uint32_t width, uint32_t height) {
@@ -405,4 +412,24 @@ bool queue_draw_sync(uint16_t token, void (*callback)(uint16_t)) {
   }
   return true;
 }
+}
+
+namespace aurora::gx {
+UberShaderState build_uber_shader_state(const ShaderConfig&, const ShaderInfo&) { return {}; }
+GenericCoverageReason uber_coverage(const ShaderConfig&, const ShaderInfo&, const gfx::RenderTargetLayout&) noexcept {
+  return GenericCoverageReason::UnsupportedDevice;
+}
+namespace testing {
+ShaderSelection shader_selection() noexcept { return ShaderSelection::Automatic; }
+void count_capacity_fallback() noexcept {}
+void count_unsupported_fallback() noexcept {}
+}
+}
+namespace aurora::gfx {
+uint64_t recording_upload_epoch() noexcept { return 0; }
+std::optional<Range> try_push_uber_state(std::span<const uint8_t>) noexcept { return std::nullopt; }
+PipelineBuildState pipeline_build_state(PipelineRef) noexcept { return PipelineBuildState::Missing; }
+bool try_get_pipeline(PipelineRef, CompiledPipeline&) noexcept { return false; }
+PipelineRef find_deferred_specialization(const gx::PipelineConfig&, const RenderTargetLayout&) { return 0; }
+PipelineRef find_uber_pipeline(const gx::PipelineConfig&, const RenderTargetLayout&) { return 0; }
 }

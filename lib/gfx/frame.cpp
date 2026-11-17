@@ -2,6 +2,7 @@
 #include "../gx/frame_interpolation.hpp"
 #include "encoding.hpp"
 #include "frame.hpp"
+#include "../gx/ubershader.hpp"
 
 #include "pipeline_cache.hpp"
 #include "readback/readback.hpp"
@@ -268,7 +269,7 @@ void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
   }
 
   g_stagingBuffers[slot].MapAsync(
-      wgpu::MapMode::Write, 0, StagingBufferSize, wgpu::CallbackMode::AllowSpontaneous,
+      wgpu::MapMode::Write, 0, allocated_staging_buffer_size(), wgpu::CallbackMode::AllowSpontaneous,
       [slot, releaseSlotOnCompletion](wgpu::MapAsyncStatus status, wgpu::StringView message) {
         if (status == wgpu::MapAsyncStatus::CallbackCancelled || status == wgpu::MapAsyncStatus::Aborted) {
           Log.warn("Buffer mapping {}: {}", magic_enum::enum_name(status), message);
@@ -471,7 +472,17 @@ void initialize() {
   tex_palette_conv::initialize();
 
   // For uniform & storage buffer offset alignments
-  g_device.GetLimits(&g_resources.limits);
+  wgpu::CompatibilityModeLimits compatibilityLimits{};
+  g_resources.limits.nextInChain = &compatibilityLimits;
+  const bool limitsAvailable = g_device.GetLimits(&g_resources.limits) == wgpu::Status::Success;
+  g_resources.limits.nextInChain = nullptr;
+  static uint64_t nextDeviceGeneration = 0;
+  g_resources.deviceGeneration = ++nextDeviceGeneration;
+  g_resources.shaderMode = aurora_get_shader_mode();
+  g_resources.hybridResources = g_resources.shaderMode == AURORA_SHADER_HYBRID && limitsAvailable &&
+      detail::supports_hybrid_resources(g_resources.limits, compatibilityLimits);
+  if (g_resources.shaderMode == AURORA_SHADER_HYBRID && !g_resources.hybridResources)
+    Log.warn("Hybrid shaders unavailable on this device; requiring specializations");
 
   const auto createBuffer = [](wgpu::Buffer& out, wgpu::BufferUsage usage, uint64_t size, const char* label) {
     if (size <= 0) {
@@ -497,9 +508,13 @@ void initialize() {
   createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
                "Shared Storage Buffer");
 
+  if (g_resources.hybridResources) {
+    createBuffer(g_resources.uberStateBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                 UberStateBufferSize, "GX shader metadata");
+  }
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     const auto label = fmt::format("Staging Buffer {}", i);
-    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
+    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, allocated_staging_buffer_size(),
                  label.c_str());
   }
 
@@ -531,11 +546,16 @@ void initialize() {
                     .type = wgpu::BufferBindingType::ReadOnlyStorage,
                 },
         },
+        wgpu::BindGroupLayoutEntry{
+            .binding = 2,
+            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+            .buffer = {.type = wgpu::BufferBindingType::ReadOnlyStorage},
+        },
     };
 
     const wgpu::BindGroupLayoutDescriptor layoutDesc{
         .label = "Static bind group layout",
-        .entryCount = layoutEntries.size(),
+        .entryCount = g_resources.hybridResources ? 3u : 2u,
         .entries = layoutEntries.data(),
     };
 
@@ -549,12 +569,13 @@ void initialize() {
             .binding = 1,
             .buffer = g_resources.storageBuffer,
         },
+        wgpu::BindGroupEntry{.binding = 2, .buffer = g_resources.uberStateBuffer},
     };
 
     const wgpu::BindGroupDescriptor bindGroupDescriptor{
         .label = "Static bind group",
         .layout = g_resources.staticBindGroupLayout,
-        .entryCount = entries.size(),
+        .entryCount = g_resources.hybridResources ? 3u : 2u,
         .entries = entries.data(),
     };
 
@@ -605,6 +626,7 @@ void initialize() {
   rmlui::initialize_pipeline();
 #endif
   initialize_pipeline_cache();
+  gx::initialize_ubershaders();
 }
 
 void shutdown() {
@@ -621,6 +643,7 @@ void shutdown() {
   }
 
   shutdown_pipeline_cache();
+  gx::shutdown_ubershaders();
   color_peek::shutdown();
   depth_peek::shutdown();
   readback::shutdown();
@@ -645,6 +668,9 @@ void shutdown() {
   g_resources.uniformBuffer = {};
   g_resources.indexBuffer = {};
   g_resources.storageBuffer = {};
+  g_resources.uberStateBuffer = {};
+  g_resources.shaderMode = AURORA_SHADER_SPECIALIZED;
+  g_resources.hybridResources = false;
   g_stagingBuffers.fill({});
 
   for (auto& packet : g_framePackets) {
@@ -751,6 +777,8 @@ bool begin_frame() {
   if constexpr (UseTextureBuffer) {
     mapBuffer(frame.textureUpload, TextureUploadSize);
   }
+
+  if (g_resources.hybridResources) mapBuffer(frame.uberStates, UberStateBufferSize);
 
   begin_recording(frame, frameSlot);
   begin_pipeline_frame();
