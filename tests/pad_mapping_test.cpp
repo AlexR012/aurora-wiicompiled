@@ -110,22 +110,24 @@ protected:
     PADSetButtonMapping(port, {static_cast<u32>(button), PAD_BUTTON_A});
   }
 
-  std::vector<uint8_t> contents(SDL_JoystickID id) {
+  std::filesystem::path mapping_file(SDL_JoystickID id) {
     const auto& controller = aurora::gamepad::g_GameControllers.at(id);
-    const auto file = directory / fmt::format("{}_{:04X}_{:04X}.controller",
-                                            aurora::gamepad::controller_name(id), controller.m_vid, controller.m_pid);
-    const auto bytes = aurora::io::read_file(file);
+    return directory / fmt::format("{}_{:04X}_{:04X}.controller", aurora::gamepad::controller_name(id),
+                                   controller.m_vid, controller.m_pid);
+  }
+
+  std::vector<uint8_t> contents(SDL_JoystickID id) {
+    const auto bytes = aurora::io::read_file(mapping_file(id));
     EXPECT_TRUE(bytes.has_value()) << SDL_GetError();
     return bytes.value_or(std::vector<uint8_t>{});
   }
 
-  void expect_binding(u32 port, SDL_GamepadButton button) {
+  void expect_binding(u32 port, SDL_GamepadButton button, PADButton padButton = PAD_BUTTON_A) {
     u32 count = 0;
     const auto* mappings = PADGetButtonMappings(port, &count);
     ASSERT_NE(mappings, nullptr);
     ASSERT_EQ(count, PAD_BUTTON_COUNT);
-    const auto mapping = std::find_if(mappings, mappings + count,
-                                      [](const auto& value) { return value.padButton == PAD_BUTTON_A; });
+    const auto mapping = std::ranges::find(mappings, mappings + count, padButton, &PADButtonMapping::padButton);
     ASSERT_NE(mapping, mappings + count);
     EXPECT_EQ(mapping->nativeButton, static_cast<u32>(button));
   }
@@ -290,6 +292,130 @@ TEST_F(PadMappingTest, FirstDeadZoneEditReplacesAnInvalidStandardMapping) {
   EXPECT_EQ(zones->stickDeadZone, 5432);
 }
 
+TEST_F(PadMappingTest, TransientReadPreservesDeadZoneEditAfterUnassignment) {
+  const auto original = add(0);
+  ASSERT_NE(original, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_NORTH);
+  auto* zones = PADGetDeadZones(0);
+  ASSERT_NE(zones, nullptr);
+  zones->stickDeadZone = 0x2031;
+  zones->substickDeadZone = 0x3456;
+  PADSerializeMappings();
+  const auto file = mapping_file(original);
+  const auto backup = directory / "saved";
+  remove(original);
+  std::filesystem::rename(file, backup);
+  ASSERT_TRUE(std::filesystem::create_directory(file));
+
+  const auto replacement = add(0);
+  ASSERT_NE(replacement, 0u);
+  zones = PADGetDeadZones(0);
+  ASSERT_NE(zones, nullptr);
+  ASSERT_EQ(zones->stickDeadZone, 0x1f40);
+  zones->stickDeadZone = 0x1f20;
+  aurora::gamepad::set_player_index(replacement, -1);
+  PADSerializeMappings();
+  ASSERT_TRUE(std::filesystem::is_directory(file));
+
+  ASSERT_TRUE(std::filesystem::remove(file));
+  std::filesystem::rename(backup, file);
+  PADSerializeMappings();
+  remove(replacement);
+  ASSERT_NE(add(0), 0u);
+  zones = PADGetDeadZones(0);
+  ASSERT_NE(zones, nullptr);
+  EXPECT_EQ(zones->stickDeadZone, 0x1f20);
+  EXPECT_EQ(zones->substickDeadZone, 0x3456);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_NORTH);
+}
+
+TEST_F(PadMappingTest, TransientReadPreservesReorderedButtonBindings) {
+  const auto original = add(0);
+  ASSERT_NE(original, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_NORTH);
+  PADSetButtonMapping(0, {SDL_GAMEPAD_BUTTON_BACK, PAD_BUTTON_B});
+  u32 count = 0;
+  auto* bindings = PADGetButtonMappings(0, &count);
+  ASSERT_NE(bindings, nullptr);
+  const auto a = std::ranges::find(bindings, bindings + count, PAD_BUTTON_A, &PADButtonMapping::padButton);
+  const auto b = std::ranges::find(bindings, bindings + count, PAD_BUTTON_B, &PADButtonMapping::padButton);
+  ASSERT_NE(a, bindings + count);
+  ASSERT_NE(b, bindings + count);
+  std::swap(*a, *b);
+  PADSerializeMappings();
+  const auto file = mapping_file(original);
+  const auto backup = directory / "saved";
+  remove(original);
+  std::filesystem::rename(file, backup);
+  ASSERT_TRUE(std::filesystem::create_directory(file));
+
+  const auto replacement = add(0);
+  ASSERT_NE(replacement, 0u);
+  bindings = PADGetButtonMappings(0, &count);
+  ASSERT_NE(bindings, nullptr);
+  const auto edit = std::ranges::find(bindings, bindings + count, PAD_BUTTON_A, &PADButtonMapping::padButton);
+  ASSERT_NE(edit, bindings + count);
+  edit->nativeButton = SDL_GAMEPAD_BUTTON_WEST;
+  ASSERT_TRUE(std::filesystem::remove(file));
+  std::filesystem::rename(backup, file);
+  PADSerializeMappings();
+
+  remove(replacement);
+  ASSERT_NE(add(0), 0u);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_BACK, PAD_BUTTON_B);
+}
+
+TEST_F(PadMappingTest, TransientReadPreservesAdapterEditAcrossReassignment) {
+  const auto first = add(0, true);
+  ASSERT_NE(first, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_WEST);
+  const auto second = add(1, true);
+  ASSERT_NE(second, 0u);
+  bind(1, SDL_GAMEPAD_BUTTON_NORTH);
+  u32 count = 0;
+  auto* axes = PADGetAxisMappings(1, &count);
+  ASSERT_NE(axes, nullptr);
+  ASSERT_EQ(count, PAD_AXIS_COUNT);
+  axes[PAD_AXIS_LEFT_X_POS].nativeAxis = {SDL_GAMEPAD_AXIS_RIGHTY, AXIS_SIGN_NEGATIVE};
+  PADSerializeMappings();
+  const auto file = mapping_file(second);
+  const auto backup = directory / "saved";
+  remove(first);
+  remove(second);
+  std::filesystem::rename(file, backup);
+  ASSERT_TRUE(std::filesystem::create_directory(file));
+
+  const auto replacement = add(1, true);
+  ASSERT_NE(replacement, 0u);
+  axes = PADGetAxisMappings(1, &count);
+  ASSERT_NE(axes, nullptr);
+  axes[PAD_AXIS_LEFT_X_POS].nativeButton = SDL_GAMEPAD_BUTTON_BACK;
+  PADSerializeMappings();
+  ASSERT_TRUE(std::filesystem::is_directory(file));
+  aurora::gamepad::set_player_index(replacement, -1);
+  PADSerializeMappings();
+  aurora::gamepad::set_player_index(replacement, 1);
+  axes = PADGetAxisMappings(1, &count);
+  ASSERT_NE(axes, nullptr);
+  EXPECT_EQ(axes[PAD_AXIS_LEFT_X_POS].nativeButton, SDL_GAMEPAD_BUTTON_BACK);
+
+  ASSERT_TRUE(std::filesystem::remove(file));
+  std::filesystem::rename(backup, file);
+  PADSerializeMappings();
+
+  remove(replacement);
+  ASSERT_NE(add(0, true), 0u);
+  ASSERT_NE(add(1, true), 0u);
+  axes = PADGetAxisMappings(1, &count);
+  ASSERT_NE(axes, nullptr);
+  EXPECT_EQ(axes[PAD_AXIS_LEFT_X_POS].nativeButton, SDL_GAMEPAD_BUTTON_BACK);
+  EXPECT_EQ(axes[PAD_AXIS_LEFT_X_POS].nativeAxis.nativeAxis, SDL_GAMEPAD_AXIS_RIGHTY);
+  EXPECT_EQ(axes[PAD_AXIS_LEFT_X_POS].nativeAxis.sign, AXIS_SIGN_NEGATIVE);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
+  expect_binding(1, SDL_GAMEPAD_BUTTON_NORTH);
+}
+
 TEST_F(PadMappingTest, MissingAdapterSlotDoesNotOverwriteOccupiedSlotAfterMove) {
   const auto first = add(0, true);
   ASSERT_NE(first, 0u);
@@ -306,6 +432,88 @@ TEST_F(PadMappingTest, MissingAdapterSlotDoesNotOverwriteOccupiedSlotAfterMove) 
   PADSerializeMappings();
   EXPECT_EQ(contents(moved), saved);
   expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
+}
+
+TEST_F(PadMappingTest, MissingAdapterSlotIsRetriedAfterDirectoryIsRemoved) {
+  const auto pad = add(0, true);
+  ASSERT_NE(pad, 0u);
+  ASSERT_NE(PADGetDeadZones(0), nullptr);
+  const auto file = mapping_file(pad);
+  ASSERT_TRUE(std::filesystem::create_directory(file));
+  PADSerializeMappings();
+  ASSERT_TRUE(std::filesystem::is_directory(file));
+  ASSERT_TRUE(std::filesystem::remove(file));
+  PADSerializeMappings();
+  EXPECT_TRUE(std::filesystem::is_regular_file(file));
+}
+
+TEST_F(PadMappingTest, MovingToAnEmptyAdapterPortStartsWithItsDefaults) {
+  const auto pad = add(0, true);
+  ASSERT_NE(pad, 0u);
+  const auto defaultZone = PADGetDeadZones(0)->stickDeadZone;
+  PADGetDeadZones(0)->stickDeadZone = 1234;
+  PADSerializeMappings();
+  aurora::gamepad::set_player_index(pad, 1);
+  EXPECT_EQ(PADGetDeadZones(1)->stickDeadZone, defaultZone);
+  PADSerializeMappings();
+  remove(pad);
+  ASSERT_NE(add(0, true), 0u);
+  ASSERT_NE(add(1, true), 0u);
+  EXPECT_EQ(PADGetDeadZones(0)->stickDeadZone, 1234);
+  EXPECT_EQ(PADGetDeadZones(1)->stickDeadZone, defaultZone);
+}
+
+TEST_F(PadMappingTest, EditedBindingIsMergedWithTheRemappedNameFile) {
+  const auto pad = add(0);
+  ASSERT_NE(pad, 0u);
+  PADGetDeadZones(0)->stickDeadZone = 4567;
+  PADSerializeMappings();
+  const auto source = mapping_file(pad);
+  const auto destination = directory / "renamed pad_1234_5678.controller";
+  std::filesystem::copy_file(source, destination);
+  PADGetDeadZones(0)->stickDeadZone = 1234;
+  PADSerializeMappings();
+  bind(0, SDL_GAMEPAD_BUTTON_WEST);
+
+  auto* device = aurora::gamepad::g_GameControllers.at(pad).m_controller;
+  auto* raw = SDL_GetGamepadMapping(device);
+  ASSERT_NE(raw, nullptr);
+  std::string mapping(raw);
+  SDL_free(raw);
+  const auto first = mapping.find(',');
+  ASSERT_NE(first, std::string::npos);
+  const auto second = mapping.find(',', first + 1);
+  ASSERT_NE(second, std::string::npos);
+  mapping.replace(first + 1, second - first - 1, "renamed pad");
+  ASSERT_TRUE(SDL_SetGamepadMapping(pad, mapping.c_str())) << SDL_GetError();
+  ASSERT_TRUE(aurora::gamepad::refresh_controller(pad));
+  ASSERT_EQ(mapping_file(pad), destination);
+  PADSerializeMappings();
+  EXPECT_EQ(PADGetDeadZones(0)->stickDeadZone, 4567);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
+  EXPECT_NE(aurora::io::read_file(source), aurora::io::read_file(destination));
+}
+
+TEST_F(PadMappingTest, HigherAdapterPortLeavesEarlierSlotsAvailableForDefaults) {
+  const auto pad = add(2, true);
+  ASSERT_NE(pad, 0u);
+  const auto defaults = *PADGetDeadZones(2);
+  ASSERT_NE(defaults.stickDeadZone, 0);
+  PADGetDeadZones(2)->stickDeadZone = 1234;
+  PADSerializeMappings();
+  const auto before = contents(pad);
+
+  aurora::gamepad::set_player_index(pad, 0);
+  EXPECT_EQ(PADGetDeadZones(0)->stickDeadZone, defaults.stickDeadZone);
+  EXPECT_EQ(PADGetDeadZones(0)->useDeadzones, defaults.useDeadzones);
+  PADSerializeMappings();
+  EXPECT_NE(contents(pad), before);
+
+  remove(pad);
+  ASSERT_NE(add(0, true), 0u);
+  ASSERT_NE(add(2, true), 0u);
+  EXPECT_EQ(PADGetDeadZones(0)->stickDeadZone, defaults.stickDeadZone);
+  EXPECT_EQ(PADGetDeadZones(2)->stickDeadZone, 1234);
 }
 
 TEST_F(PadMappingTest, AdapterWritesPreserveOtherPortSlots) {

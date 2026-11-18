@@ -106,6 +106,23 @@ TEST_F(GxTextureCacheTest, UntrackedObjectDetectsChangedBytes) {
   EXPECT_EQ(testing::texture_allocations(), 2);
 }
 
+TEST_F(GxTextureCacheTest, NewGenerationWithUnchangedPixelsReusesObject) {
+  testing::set_guest_write_generation(0);
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  const auto first = texture::resolve_static_texture(obj);
+  const auto hashed = texture_stats().hashedBytes;
+  const auto hits = texture_stats().objectHits;
+
+  testing::set_guest_write_generation(1);
+  texture::invalidate_sources();
+
+  EXPECT_EQ(texture::resolve_static_texture(obj), first);
+  EXPECT_GT(texture_stats().hashedBytes, hashed);
+  EXPECT_EQ(texture_stats().objectHits, hits + 1);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+}
+
 TEST_F(GxTextureCacheTest, TrackedObjectDetectsChangedGeneration) {
   testing::set_guest_write_generation(0);
   std::array<uint8_t, 16> pixels{};
