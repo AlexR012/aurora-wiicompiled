@@ -4,17 +4,12 @@
 #include "gx.hpp"
 
 namespace aurora::gx {
-enum class DrawShaderSelection : u8 { Specialized, Hybrid, GenericOnly, RequiredSpecialized };
 struct DrawData {
   gfx::PipelineRef pipeline;
-  gfx::PipelineRef fallbackPipeline = 0;
   GXBindGroups bindGroups;
-  uint32_t vertSize;
+  gfx::Range vertRange;
   gfx::Range idxRange;
-  uint32_t uniformOffset;
-  uint16_t uniformSize;
-  DrawShaderSelection selection = DrawShaderSelection::Specialized;
-  uint8_t reserved = 0;
+  gfx::Range uniformRange;
   // First interpolated copy of the uniform block; slot k follows at k aligned block sizes.
   uint32_t interpUniformBase = UINT32_MAX;
   DrawImmediateData immediateData;
@@ -23,9 +18,6 @@ struct DrawData {
   uint32_t instanceCount;
   uint32_t dstAlpha;
 };
-
-static_assert(std::is_trivially_copyable_v<DrawData> && std::is_aggregate_v<DrawData>);
-static_assert(sizeof(DrawData) <= gfx::InlineDrawPayloadSize);
 
 constexpr uint32_t GXPipelineConfigVersion = 14;
 struct PipelineConfig {
@@ -52,12 +44,6 @@ struct PipelineOptions {
   bool depthUpdate = false;
 };
 
-struct PipelinePlan {
-  PipelineOptions main, prepass;
-  bool hasPrepass = false;
-  u32 normalAttachment = UINT32_MAX;
-};
-PipelinePlan make_pipeline_plan(const PipelineConfig&, const gfx::RenderTargetLayout&);
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 

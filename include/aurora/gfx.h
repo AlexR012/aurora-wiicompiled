@@ -73,14 +73,6 @@ void aurora_get_frame_interpolation_diagnostics(AuroraFrameInterpolationDiagnost
 void aurora_set_frame_interpolation_fps(uint32_t targetFps);
 uint32_t aurora_get_frame_interpolation_fps();
 
-typedef enum AuroraShaderMode {
-  AURORA_SHADER_SPECIALIZED = 0,
-  AURORA_SHADER_HYBRID = 1,
-} AuroraShaderMode;
-// Applies to the next renderer initialization.
-void aurora_set_shader_mode(AuroraShaderMode mode);
-AuroraShaderMode aurora_get_shader_mode();
-
 // When enabled, draws whose pipeline is still compiling are skipped instead of stalling.
 void aurora_set_skip_unready_pipelines(bool enabled);
 bool aurora_get_skip_unready_pipelines();

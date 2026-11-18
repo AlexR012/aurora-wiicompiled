@@ -255,9 +255,13 @@ u32 line_texcoord_mask() noexcept {
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   ZoneScoped;
 
-  ShaderInfo info{};
+  ShaderInfo info{
+      // render/logical viewport size, proj
+      .uniformSize = 8 + 8 + 64,
+  };
 
   if (config.lineMode != 0) {
+    info.uniformSize += 4 + 4 + 4 + 4; // line_width, line_aspect_y, line_tex_offset, line_texcoord_mask
     info.lineMode = config.lineMode;
   }
 
@@ -269,6 +273,9 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       info.indexAttr.set(attr);
     }
   }
+
+  // 10 position matrices, 10 texture matrices, 10 normal matrices.
+  info.uniformSize += sizeof(Mat3x4<float>) * 30;
 
   for (int i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
@@ -343,6 +350,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
+  info.uniformSize += info.loadsTevReg.count() * sizeof(Vec4<float>);
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (info.sampledColorChannels.test(i)) {
       const auto& cc = config.colorChannels[i];
@@ -352,6 +360,29 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       }
     }
   }
+  if (info.lightingEnabled) {
+    // Lights + light state for all channels
+    info.uniformSize += 16 + sizeof(Light) * GX::MaxLights;
+  }
+  for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
+    if (info.sampledColorChannels.test(i)) {
+      const auto& cc = config.colorChannels[i];
+      if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
+        info.uniformSize += sizeof(Vec4<float>);
+      }
+      if (cc.matSrc == GX_SRC_REG) {
+        info.uniformSize += sizeof(Vec4<float>);
+      }
+      const auto& cca = config.colorChannels[i + GX_ALPHA0];
+      if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
+        info.uniformSize += sizeof(Vec4<float>);
+      }
+      if (cca.matSrc == GX_SRC_REG) {
+        info.uniformSize += sizeof(Vec4<float>);
+      }
+    }
+  }
+  info.uniformSize += info.sampledKColors.count() * sizeof(Vec4<float>);
   for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
     if (!info.sampledTexCoords.test(i)) {
       continue;
@@ -362,41 +393,22 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       info.usesPTTexMtx.set(postMtxIdx);
     }
   }
+  if (info.usesPTTexMtx.any()) {
+    info.uniformSize += sizeof(Mat3x4<float>) * MaxPTTexMtx;
+  }
   if (config.fogType != GX_FOG_NONE) {
     info.usesFog = true;
+    info.uniformSize += sizeof(Fog);
   }
-  auto& offsets = info.offsets;
-  std::memset(&offsets, 0xff, sizeof(offsets));
-  u32 cursor = 16 + (info.lineMode ? 16 : 0);
-  const auto allocate = [&](u32 size) { const auto offset = cursor; cursor += size; return offset; };
-  offsets.projection = allocate(64);
-  offsets.postex = allocate((MaxPnMtx + MaxTexMtx) * 48);
-  offsets.nrm = allocate(MaxPnMtx * 48);
-  for (u32 i = 0; i < MaxTevRegs; ++i)
-    if (info.loadsTevReg[i]) offsets.tevreg[i] = allocate(16);
-  if (info.lightingEnabled) {
-    offsets.lights = allocate(sizeof(Light) * GX::MaxLights);
-    offsets.lightState = allocate(16);
+	if (info.usesZTexture) {
+		info.uniformSize += sizeof(Vec4<u32>);
+	}
+  info.uniformSize += MaxTexCoord * sizeof(Vec4<float>);
+  if (info.usedIndTexMtxs.any()) {
+    info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
-  for (u32 i = 0; i < info.sampledColorChannels.size(); ++i) {
-    if (!info.sampledColorChannels[i]) continue;
-    for (u32 channel : {i, i + GX_ALPHA0}) {
-      const auto& cc = config.colorChannels[channel];
-      if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) offsets.ambient[channel] = allocate(16);
-      if (cc.matSrc == GX_SRC_REG) offsets.material[channel] = allocate(16);
-    }
-  }
-  for (u32 i = 0; i < MaxKColors; ++i)
-    if (info.sampledKColors[i]) offsets.kcolor[i] = allocate(16);
-  if (info.usesPTTexMtx.any()) offsets.postmtx = allocate(MaxPTTexMtx * 48);
-  if (info.usesFog) offsets.fog = allocate(sizeof(Fog));
-  if (info.usesZTexture) offsets.ztexture = allocate(16);
-  for (auto& offset : offsets.texcoordScale) offset = allocate(16);
-  if (info.usedIndTexMtxs.any()) offsets.indmtx = allocate(MaxIndTexMtxs * 32);
-  for (u32 i = 0; i < MaxTextures; ++i)
-    if (info.sampledTextures[i]) offsets.texSizeBias[i] = allocate(16);
-  offsets.end = cursor;
-  info.uniformSize = gfx::align_uniform(cursor);
+  info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
+  info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
   }
@@ -423,10 +435,6 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
       buf.append<u32>(line_texcoord_mask());
     }
   }
-  const auto at = [&](u32 offset) {
-    AURORA_ASSERT(buf.size() == offset, "Uniform cursor {} != {}", buf.size(), offset);
-  };
-  at(info.offsets.projection);
   auto proj = g_gxState.proj;
   if constexpr (UseReversedZ) {
     proj.m2 = proj.m2 * Vec4{-1.f, -1.f, -1.f, -1.f};
@@ -435,7 +443,6 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
   }
   buf.append(proj);
 
-  at(info.offsets.postex);
   for (int i = 0; i < MaxPnMtx; i++) {
     buf.append(g_gxState.pnMtx[i].pos);
   }
@@ -444,25 +451,21 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
     buf.append(g_gxState.texMtxs[i]);
   }
 
-  at(info.offsets.nrm);
   for (int i = 0; i < MaxPnMtx; i++) {
     buf.append(g_gxState.pnMtx[i].nrm);
   }
 
   for (int i = 0; i < info.loadsTevReg.size(); ++i) {
     if (info.loadsTevReg.test(i)) {
-      at(info.offsets.tevreg[i]);
       buf.append(g_gxState.colorRegs[i]);
     }
   }
   if (info.lightingEnabled) {
-    at(info.offsets.lights);
     // Lights
     static_assert(sizeof(g_gxState.lights) == 80 * GX::MaxLights);
     for (const auto& light : g_gxState.lights) {
       buf.append(prepare_shader_light(light));
     }
-    at(info.offsets.lightState);
     // Light state for all channels
     for (int i = 0; i < 4; ++i) {
       buf.append<u32>(g_gxState.colorChannelState[i].lightMask.to_ulong());
@@ -475,32 +478,26 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
     const auto& ccc = g_gxState.colorChannelConfig[i];
     const auto& ccs = g_gxState.colorChannelState[i];
     if (ccc.lightingEnabled && ccc.ambSrc == GX_SRC_REG) {
-      at(info.offsets.ambient[i]);
       buf.append(ccs.ambColor);
     }
     if (ccc.matSrc == GX_SRC_REG) {
-      at(info.offsets.material[i]);
       buf.append(ccs.matColor);
     }
     const auto& ccca = g_gxState.colorChannelConfig[i + GX_ALPHA0];
     const auto& ccsa = g_gxState.colorChannelState[i + GX_ALPHA0];
     if (ccca.lightingEnabled && ccca.ambSrc == GX_SRC_REG) {
-      at(info.offsets.ambient[i + GX_ALPHA0]);
       buf.append(ccsa.ambColor);
     }
     if (ccca.matSrc == GX_SRC_REG) {
-      at(info.offsets.material[i + GX_ALPHA0]);
       buf.append(ccsa.matColor);
     }
   }
   for (int i = 0; i < info.sampledKColors.size(); ++i) {
     if (info.sampledKColors.test(i)) {
-      at(info.offsets.kcolor[i]);
       buf.append(g_gxState.kcolors[i]);
     }
   }
   if (info.usesPTTexMtx.any()) {
-    at(info.offsets.postmtx);
     for (int i = 0; i < info.usesPTTexMtx.size(); ++i) {
       buf.append(g_gxState.ptTexMtxs[i]);
     }
@@ -523,19 +520,15 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
     }
     fog.rangeK[2][2] = fog.rangeK[2][1];
     fog.rangeK[2][3] = fog.rangeK[2][1];
-    at(info.offsets.fog);
     buf.append(fog);
   }
 	if (info.usesZTexture) {
-		at(info.offsets.ztexture);
 		buf.append(Vec4<u32>{g_gxState.zTextureBias, 0, 0, 0});
 	}
-  at(info.offsets.texcoordScale[0]);
   for (const auto& scale : g_gxState.texCoordScales) {
     buf.append(Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f});
   }
   if (info.usedIndTexMtxs.any()) {
-    at(info.offsets.indmtx);
     for (u32 i = 0; i < MaxIndTexMtxs; ++i) {
       const auto& mtx = g_gxState.indTexMtxs[i];
       // S0.10 mantissas; z is the shift applied after the >> 3
@@ -549,10 +542,8 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
     if (!info.sampledTextures.test(i)) {
       continue;
     }
-    at(info.offsets.texSizeBias[i]);
     buf.append(texture_size_bias(get_texture(static_cast<GXTexMapID>(i))));
   }
-  at(info.offsets.end);
 }
 
 gfx::Range build_uniform(const ShaderInfo& info) noexcept {

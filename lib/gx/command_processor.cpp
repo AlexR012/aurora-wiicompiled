@@ -10,8 +10,6 @@
 #include "readback.hpp"
 #include "regs.hpp"
 #include "shader_info.hpp"
-#include "ubershader.hpp"
-#include "../gfx/resources.hpp"
 #include "texture.hpp"
 
 #include <tracy/Tracy.hpp>
@@ -134,11 +132,6 @@ std::vector<FogRangeLutEntry> sFogRangeLuts;
 
 struct DrawCache {
   uint64_t targetLayoutKey = 0;
-  uint64_t deviceGeneration = 0, uploadEpoch = 0, drawEpoch = 0;
-  gfx::PipelineRef genericRef = 0;
-  u32 genericOffset = UINT32_MAX;
-  GenericCoverageReason coverage = GenericCoverageReason::UnsupportedDevice;
-  testing::ShaderSelection testSelection = testing::ShaderSelection::Automatic;
   PipelineConfig config{};
   ShaderInfo shaderInfo{};
   gfx::PipelineRef pipelineRef{};
@@ -147,7 +140,6 @@ struct DrawCache {
   GXVtxFmt fmt = GX_MAX_VTXFMT;
   u8 lineMode = 0;
   bool hasPipeline = false;
-  bool specializationReady = false;
   gfx::Range uniformRange{};
   gfx::Range fogRange{};
   FogRangeLutKey fogRangeKey{};
@@ -509,33 +501,16 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   }
 
   const u8 lineMode = line_mode_for_prim(prim);
-  const auto layout = gfx::get_render_target_layout();
-  const auto targetLayoutKey = layout.key;
-  const auto& resources = gfx::detail::resources();
-  const bool hybrid = resources.shaderMode == AURORA_SHADER_HYBRID;
-  const auto testSelection = hybrid ? testing::shader_selection() : testing::ShaderSelection::Automatic;
+  const auto targetLayoutKey = gfx::get_render_target_layout().key;
   const bool pipelineValid = cache.hasPipeline && (state.dirty & DirtyPipeline) == 0 && cache.fmt == fmt &&
-                             cache.lineMode == lineMode && cache.targetLayoutKey == targetLayoutKey &&
-                             cache.deviceGeneration == resources.deviceGeneration && cache.testSelection == testSelection;
+                             cache.lineMode == lineMode && cache.targetLayoutKey == targetLayoutKey;
   if (!pipelineValid) {
     const bool hadPipeline = cache.hasPipeline;
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
     populate_pipeline_config(cache.config, prim, fmt);
     cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
-    cache.specializationReady = false;
-    cache.genericRef = 0;
-    cache.genericOffset = UINT32_MAX;
-    cache.uploadEpoch = 0;
-    cache.coverage = hybrid ? uber_coverage(cache.config.shaderConfig, cache.shaderInfo, layout)
-                            : GenericCoverageReason::UnsupportedDevice;
-    if (hybrid) {
-      cache.pipelineRef = testSelection == testing::ShaderSelection::Generic && cache.coverage == GenericCoverageReason::Covered
-                              ? xxh3_hash(layout.key, xxh3_hash(cache.config, static_cast<HashType>(gfx::ShaderType::GX)))
-                              : gfx::find_deferred_specialization(cache.config, layout);
-    } else { cache.pipelineRef = gfx::pipeline_ref(cache.config); }
-    cache.deviceGeneration = resources.deviceGeneration;
-    cache.testSelection = testSelection;
+    cache.pipelineRef = gfx::pipeline_ref(cache.config);
     cache.targetLayoutKey = targetLayoutKey;
     cache.fmt = fmt;
     cache.lineMode = lineMode;
@@ -544,35 +519,6 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     if (!hadPipeline || prevSampledTextures != cache.shaderInfo.sampledTextures ||
         prevSampledIndTextures != cache.shaderInfo.sampledIndTextures) {
       cache.bindGeneration = 0;
-    }
-  }
-
-  DrawShaderSelection selection = DrawShaderSelection::Specialized;
-  if (hybrid) {
-    selection = DrawShaderSelection::RequiredSpecialized;
-    if (!cache.specializationReady && testSelection != testing::ShaderSelection::Generic)
-      cache.specializationReady = gfx::pipeline_build_state(cache.pipelineRef) == gfx::PipelineBuildState::Ready;
-    if (testSelection != testing::ShaderSelection::Specialized &&
-        (testSelection == testing::ShaderSelection::Generic || !cache.specializationReady)) {
-      if (cache.coverage == GenericCoverageReason::Covered) {
-        const auto epoch = gfx::recording_upload_epoch();
-        if (cache.uploadEpoch != epoch) {
-          cache.uploadEpoch = epoch;
-          cache.genericOffset = UINT32_MAX;
-          const auto snapshot = build_uber_shader_state(cache.config.shaderConfig, cache.shaderInfo);
-          const auto range = gfx::try_push_uber_state({reinterpret_cast<const u8*>(&snapshot), sizeof(snapshot)});
-          if (range) cache.genericOffset = range->offset;
-        }
-        if (cache.genericOffset != UINT32_MAX) {
-          if (!cache.genericRef) cache.genericRef = gfx::find_uber_pipeline(cache.config, layout);
-          immediates.uberStateOffset = cache.genericOffset;
-          selection = testSelection == testing::ShaderSelection::Generic ? DrawShaderSelection::GenericOnly
-                                                                          : DrawShaderSelection::Hybrid;
-        } else { testing::count_capacity_fallback(); }
-      } else { testing::count_unsupported_fallback(); }
-      if (selection == DrawShaderSelection::RequiredSpecialized && testSelection == testing::ShaderSelection::Generic) {
-        Log.fatal("Forced generic draw unsupported or metadata exhausted");
-      }
     }
   }
 
@@ -672,16 +618,12 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     instanceCount = vtxCount;
   }
   cache.lastDrawFmt = fmt;
-  cache.drawEpoch = hybrid ? gfx::recording_upload_epoch() : 0;
   gfx::push_draw_command(DrawData{
       .pipeline = cache.pipelineRef,
-      .fallbackPipeline = cache.genericRef,
       .bindGroups = cache.bindGroups,
-      .vertSize = vertRange.size,
+      .vertRange = vertRange,
       .idxRange = idxRange,
-      .uniformOffset = cache.uniformRange.offset,
-      .uniformSize = static_cast<uint16_t>(cache.uniformRange.size),
-      .selection = selection,
+      .uniformRange = cache.uniformRange,
       .interpUniformBase = cache.interpUniformBase,
       .immediateData = immediates,
       .vtxCount = vtxCount,
@@ -738,10 +680,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     return;
   }
 
-  const bool cleanState =
-      (gfx::detail::resources().shaderMode != AURORA_SHADER_HYBRID ||
-       (sDrawCache.drawEpoch == gfx::recording_upload_epoch() &&
-        sDrawCache.testSelection == testing::shader_selection())) && g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
+  const bool cleanState = g_gxState.dirty == 0 && fmt == sDrawCache.lastDrawFmt && sDrawCache.lineMode == 0 &&
                           prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
   auto* lastDraw = cleanState ? gfx::get_last_draw_command<DrawData>() : nullptr;
   const bool canMerge = lastDraw != nullptr && lastDraw->instanceCount == 1 &&
@@ -766,15 +705,15 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       idxRange = gfx::push_indices(idxBuf.data(), idxBuf.size(), hadIndexRange ? 0 : 4);
       idxBuf.clear();
     }
-    CHECK(lastDraw->immediateData.vtxStart + lastDraw->vertSize == vertRange.offset,
-          "Non-consecutive vertex ranges ({} < {})", lastDraw->immediateData.vtxStart + lastDraw->vertSize,
+    CHECK(lastDraw->vertRange.offset + lastDraw->vertRange.size == vertRange.offset,
+          "Non-consecutive vertex ranges ({} < {})", lastDraw->vertRange.offset + lastDraw->vertRange.size,
           vertRange.offset);
     if (hadIndexRange) {
       CHECK(lastDraw->idxRange.offset + lastDraw->idxRange.size == idxRange.offset,
             "Non-consecutive index ranges ({} < {})", lastDraw->idxRange.offset + lastDraw->idxRange.size,
             idxRange.offset);
     }
-    lastDraw->vertSize += vertRange.size;
+    lastDraw->vertRange.size += vertRange.size;
     if (lastDraw->idxRange.size == 0) {
       lastDraw->idxRange = idxRange;
     } else {
@@ -1049,8 +988,6 @@ void handle_aurora(ByteReader& reader) noexcept {
 }
 
 void clear_draw_cache() noexcept {
-  sDrawCache.uploadEpoch = 0;
-  sDrawCache.genericOffset = UINT32_MAX;
   sDrawCache.bindGeneration = 0;
   sDrawCache.uniformRange = {};
   sDrawCache.fogRange = {};

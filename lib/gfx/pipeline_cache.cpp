@@ -6,7 +6,6 @@
 #include "hash.hpp"
 #include "../gx/pipeline.hpp"
 #include "../gx/shader_info.hpp"
-#include "../gx/ubershader.hpp"
 #include "../io.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -81,7 +80,6 @@ struct SdlVfsSqliteFile {
   SDL_IOStream* io = nullptr;
 };
 
-static std::atomic<testing::PipelineCreateHook> g_pipelineCreateHook{nullptr};
 static std::mutex g_pipelineMutex;
 static bool g_hasPipelineThread = false;
 static size_t g_pipelinesPerFrame = 0;
@@ -487,13 +485,13 @@ static void persist_known_pipeline_locked(HashType cacheKey) {
 static void store_pipeline_locked(PipelineRef hash, HashType cacheKey, CompiledPipeline&& pipeline) {
   const bool compiled = static_cast<bool>(pipeline.main);
   g_pipelines.try_emplace(hash, std::move(pipeline));
-  if (compiled && cacheKey != 0) {
+  if (compiled) {
     persist_known_pipeline_locked(cacheKey);
   }
 }
 
 static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, HashType cacheKey, NewPipelineCallback&& cb,
-                                      PipelinePriority priority = PipelinePriority::Normal, bool deferCreation = false) {
+                                      PipelinePriority priority = PipelinePriority::Normal) {
   ZoneScoped;
 
   const bool blocking = priority == PipelinePriority::Blocking;
@@ -504,7 +502,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, HashType cacheKey,
   {
     std::scoped_lock guard{g_pipelineMutex};
     if (const auto it = g_pipelines.find(runtimeKey); it != g_pipelines.end()) {
-      if (it->second.main && cacheKey != 0) {
+      if (it->second.main) {
         persist_known_pipeline_locked(cacheKey);
       }
       return runtimeKey;
@@ -529,7 +527,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, HashType cacheKey,
         promote_pending_pipeline(runtimeKey, priority);
         notifyWorker = priority != PipelinePriority::Background;
       }
-    } else if (!g_hasPipelineThread && !deferCreation && (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
+    } else if (!g_hasPipelineThread && (blocking || g_pipelinesPerFrame < BuildPipelinesPerFrame)) {
       auto result = cb();
       pipelineCount = result.pipeline_count();
       store_pipeline_locked(runtimeKey, cacheKey, std::move(result));
@@ -576,32 +574,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& c
   const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
   const auto runtimeKey = xxh3_hash(layout.key, cacheKey);
   return find_pipeline_impl(
-      runtimeKey, cacheKey, [config, layout, runtimeKey] {
-        if (const auto hook = g_pipelineCreateHook.load(); hook && !hook(runtimeKey, false)) return CompiledPipeline{};
-        if (detail::resources().shaderMode == AURORA_SHADER_HYBRID)
-          return gx::create_hybrid_specialization(config, layout);
-        return create_pipeline(config, layout);
-      }, priority);
-}
-
-PipelineRef find_deferred_specialization(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
-  remember_pipeline_config(ShaderType::GX, config, current_frame(), false);
-  const auto cacheKey = xxh3_hash(config, static_cast<HashType>(ShaderType::GX));
-  const auto runtimeKey = xxh3_hash(layout.key, cacheKey);
-  return find_pipeline_impl(runtimeKey, cacheKey, [config, layout, runtimeKey] {
-    if (const auto hook = g_pipelineCreateHook.load(); hook && !hook(runtimeKey, false)) return CompiledPipeline{};
-    return gx::create_hybrid_specialization(config, layout);
-  }, PipelinePriority::Background, true);
-}
-
-PipelineRef find_uber_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
-  const auto key = gx::uber_pipeline_key(config, layout);
-  // Generic entries have no persistent material record.
-  const auto runtimeKey = xxh3_hash(key, 0x4758554245520001ull);
-  return find_pipeline_impl(runtimeKey, 0, [config, layout, runtimeKey] {
-    if (const auto hook = g_pipelineCreateHook.load(); hook && !hook(runtimeKey, true)) return CompiledPipeline{};
-    return gx::create_uber_pipeline(config, layout);
-  }, PipelinePriority::Blocking);
+      runtimeKey, cacheKey, [config, layout] { return create_pipeline(config, layout); }, priority);
 }
 
 static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig& config,
@@ -1196,25 +1169,15 @@ void rebuild_pipeline_cache() {
     }
   }
   std::ranges::sort(known, {}, &KnownPipeline::firstFrameUsed);
-  if (detail::resources().hybridResources) {
-    for (const auto& pipeline : known) {
-      if (const auto* config = std::get_if<gx::PipelineConfig>(&pipeline.config)) {
-        const auto info = gx::build_shader_info(config->shaderConfig);
-        if (gx::uber_coverage(config->shaderConfig, info, scene) == gx::GenericCoverageReason::Covered)
-          find_uber_pipeline(*config, scene);
-        if (offscreen.key != scene.key &&
-            gx::uber_coverage(config->shaderConfig, info, offscreen) == gx::GenericCoverageReason::Covered)
-          find_uber_pipeline(*config, offscreen);
-      }
-    }
-  }
   for (const auto& pipeline : known) {
     std::visit(
         [&](const auto& config) {
           resolve_pipeline(pipeline.type, config, scene, PipelinePriority::Background);
-          if (offscreen.key != scene.key)
+          if (offscreen.key != scene.key) {
             resolve_pipeline(pipeline.type, config, offscreen, PipelinePriority::Background);
-        }, pipeline.config);
+          }
+        },
+        pipeline.config);
   }
 }
 
@@ -1261,7 +1224,6 @@ void shutdown_pipeline_cache() {
 
     g_pipelineThreads.clear();
   }
-  g_pipelineCreateHook.store(nullptr);
   gx::clear_shader_module_cache();
   g_hasPipelineThread = false;
 
@@ -1316,51 +1278,6 @@ static void move_pending_pipeline_to_front(PipelineRef hash) {
     g_pipelineQueue.erase(it);
     g_pipelineQueue.emplace_front(std::move(pending));
   }
-}
-
-namespace testing {
-void set_pipeline_create_hook(PipelineCreateHook hook) noexcept { g_pipelineCreateHook.store(hook); }
-}
-PipelineBuildState pipeline_build_state(PipelineRef ref) noexcept {
-  std::lock_guard lock{g_pipelineMutex};
-  if (auto it = g_pipelines.find(ref); it != g_pipelines.end())
-    return it->second.main ? PipelineBuildState::Ready : PipelineBuildState::Failed;
-  return g_pendingPipelines.contains(ref) ? PipelineBuildState::Pending : PipelineBuildState::Missing;
-}
-bool try_get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) noexcept {
-  std::lock_guard lock{g_pipelineMutex};
-  const auto it = g_pipelines.find(ref);
-  if (it == g_pipelines.end() || !it->second.main) return false;
-  pipeline = it->second;
-  return true;
-}
-bool get_pipeline_ready(PipelineRef ref, CompiledPipeline& pipeline) {
-  bool created = false;
-  uint32_t count = 0;
-  {
-    std::unique_lock lock{g_pipelineMutex};
-    if (const auto it = g_pipelines.find(ref); it != g_pipelines.end()) {
-      if (!it->second.main) return false;
-      pipeline = it->second;
-      return true;
-    }
-    if (!g_pendingPipelines.contains(ref)) return false;
-    g_requiredPipelines.insert(ref);
-    if (!g_hasPipelineThread) {
-      if (auto pending = take_pending_pipeline(ref)) {
-        auto result = pending->create();
-        count = result.pipeline_count();
-        store_pipeline_locked(ref, pending->cacheKey, std::move(result));
-        g_pipelinesPerFrame += std::max(1u, count);
-        created = true;
-      }
-    } else {
-      move_pending_pipeline_to_front(ref);
-      g_pipelineQueueCv.notify_one();
-    }
-  }
-  if (created) notify_pipeline_ready(true, count);
-  return get_pipeline(ref, pipeline);
 }
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {

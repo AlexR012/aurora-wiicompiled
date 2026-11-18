@@ -246,7 +246,6 @@ StagingHighWater current_high_water(const FramePacket& frame) noexcept {
       .uniforms = static_cast<uint32_t>(frame.uniforms.size()),
       .indices = static_cast<uint32_t>(frame.indices.size()),
       .storage = static_cast<uint32_t>(frame.storage.size()),
-      .uberStates = static_cast<uint32_t>(frame.uberStates.size()),
       .textureUpload = static_cast<uint32_t>(frame.textureUpload.size()),
       .textureUploadCount = frame.textureUploads.size(),
   };
@@ -576,27 +575,7 @@ void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
 
 namespace detail {
 
-static uint64_t g_uploadEpoch = 0;
-static absl::flat_hash_map<std::string, Range> g_uberStateRanges;
-uint64_t upload_epoch() noexcept { return g_uploadEpoch; }
-std::optional<Range> push_uber_state(std::span<const uint8_t> data) noexcept {
-  if (!g_recorder.active() || resources().shaderMode != AURORA_SHADER_HYBRID || data.empty()) return std::nullopt;
-  const std::string key(reinterpret_cast<const char*>(data.data()), data.size());
-  if (auto it = g_uberStateRanges.find(key); it != g_uberStateRanges.end()) return it->second;
-  auto& buffer = g_recorder.frame().uberStates;
-  const size_t offset = AURORA_ALIGN(buffer.size(), 4);
-  const size_t cap = std::min<size_t>(buffer.capacity(), UberStateBufferSize);
-  if (offset > cap || data.size() > cap - offset) return std::nullopt;
-  buffer.append_zeroes(offset - buffer.size());
-  buffer.append(data.data(), data.size());
-  const Range range{static_cast<uint32_t>(offset), static_cast<uint32_t>(data.size())};
-  g_uberStateRanges.emplace(key, range);
-  return range;
-}
-
 void begin_recording(FramePacket& packet, size_t frameSlot) {
-  ++g_uploadEpoch;
-  g_uberStateRanges.clear();
   CHECK(!g_recorder.active(), "A recording session is already active");
   if (g_recorder.normalRequested && webgpu::enable_normal_buffer()) {
     g_recorder.normalRequested = false;
@@ -656,7 +635,6 @@ RecordedFrame end_recording() {
 }
 
 void shutdown_recording() {
-  g_uberStateRanges.clear();
   for (auto& pool : g_passSnapshotPools) {
     pool = {};
   }
@@ -1327,9 +1305,6 @@ const uint8_t* uniform_data(const Range& range) noexcept {
 }
 
 const uint8_t* vertex_data(const Range& range) noexcept { return current_frame_packet().verts.data() + range.offset; }
-
-uint64_t recording_upload_epoch() noexcept { return detail::upload_epoch(); }
-std::optional<Range> try_push_uber_state(std::span<const uint8_t> data) noexcept { return detail::push_uber_state(data); }
 
 Range push_storage(const uint8_t* data, size_t length) {
   ZoneScoped;

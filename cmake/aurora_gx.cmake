@@ -37,9 +37,6 @@ add_library(aurora_gx STATIC
         ${CMAKE_CURRENT_LIST_DIR}/../lib/gx/readback.cpp
         ${CMAKE_CURRENT_LIST_DIR}/../lib/gx/shader.cpp
         ${CMAKE_CURRENT_LIST_DIR}/../lib/gx/shader_info.cpp
-        ${CMAKE_CURRENT_LIST_DIR}/../lib/gx/ubershader.cpp
-        ${CMAKE_CURRENT_LIST_DIR}/../lib/gx/uber_vertex.cpp
-        ${CMAKE_CURRENT_LIST_DIR}/../lib/gx/uber_fragment.cpp
         ${CMAKE_CURRENT_LIST_DIR}/../lib/dolphin/gx/GXBump.cpp
         ${CMAKE_CURRENT_LIST_DIR}/../lib/dolphin/gx/GXCull.cpp
         ${CMAKE_CURRENT_LIST_DIR}/../lib/dolphin/gx/GXCpu2Efb.cpp

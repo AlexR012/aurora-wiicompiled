@@ -22,7 +22,6 @@
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
 #include "../gfx/render_worker.hpp"
-#include "../gfx/resources.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu_prof.hpp"
@@ -938,13 +937,10 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
            magic_enum::enum_name(g_adapterInfo.adapterType), description);
 
   {
-    wgpu::CompatibilityModeLimits supportedCompatibility{};
-    wgpu::Limits supportedLimits{.nextInChain = &supportedCompatibility};
-    const bool limitsAvailable = g_adapter.GetLimits(&supportedLimits) == wgpu::Status::Success;
-    const bool hybridStorage = aurora_get_shader_mode() == AURORA_SHADER_HYBRID && limitsAvailable &&
-        gfx::detail::supports_hybrid_resources(supportedLimits, supportedCompatibility);
+    wgpu::Limits supportedLimits{};
+    g_adapter.GetLimits(&supportedLimits);
     wgpu::CompatibilityModeLimits compatibilityModeLimits{wgpu::CompatibilityModeLimits::Init{
-        .maxStorageBuffersInVertexStage = hybridStorage ? 3u : 2u,
+        .maxStorageBuffersInVertexStage = 2,
         .maxStorageBuffersInFragmentStage = 2,
     }};
     g_maxTextureDimension2D = supportedLimits.maxTextureDimension2D;
@@ -959,12 +955,11 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
                                                                             : supportedLimits.maxTextureDimension3D,
         .maxTextureArrayLayers = supportedLimits.maxTextureArrayLayers == 0 ? WGPU_LIMIT_U32_UNDEFINED
                                                                             : supportedLimits.maxTextureArrayLayers,
-        .maxStorageBuffersPerShaderStage = hybridStorage ? 3u : 2u,
+        .maxStorageBuffersPerShaderStage = 2,
         .minUniformBufferOffsetAlignment =
             supportedLimits.minUniformBufferOffsetAlignment < 64 ? 64 : supportedLimits.minUniformBufferOffsetAlignment,
         .minStorageBufferOffsetAlignment =
             supportedLimits.minStorageBufferOffsetAlignment < 16 ? 16 : supportedLimits.minStorageBufferOffsetAlignment,
-        .maxInterStageShaderVariables = hybridStorage ? 11u : wgpu::kLimitU32Undefined,
         .maxImmediateSize = sizeof(gx::DrawImmediateData),
     };
     Log.info(

@@ -201,18 +201,6 @@ if (AURORA_ENABLE_GX)
   target_link_libraries(shader_module_cache_tests PRIVATE gtest gtest_main absl::flat_hash_map Threads::Threads)
   gtest_discover_tests(shader_module_cache_tests PROPERTIES TIMEOUT 30)
 
-  add_executable(gx_shader_layout_tests gx_shader_layout_test.cpp)
-  add_executable(gx_shader_gpu_tests gx_shader_gpu_test.cpp)
-  foreach(shader_test gx_shader_layout_tests gx_shader_gpu_tests)
-    target_include_directories(${shader_test} PRIVATE ../include ../lib)
-    target_compile_definitions(${shader_test} PRIVATE AURORA TARGET_PC=1)
-    target_link_libraries(${shader_test} PRIVATE aurora::gx aurora::vi
-        absl::flat_hash_map gtest gtest_main Threads::Threads PNG::PNG)
-    aurora_copy_runtime_dlls(${shader_test})
-  endforeach()
-  gtest_discover_tests(gx_shader_layout_tests PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
-  gtest_discover_tests(gx_shader_gpu_tests PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE LABELS gpu)
-
   add_executable(texture_replacement_streaming_tests
     texture_replacement_streaming_test.cpp
   )

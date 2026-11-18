@@ -12,10 +12,6 @@ inline constexpr size_t StagingBufferCount = FrameSlotCount + 3;
 inline constexpr uint64_t StagingBufferSize = UniformBufferSize + VertexBufferSize + IndexBufferSize +
                                               StorageBufferSize + (UseTextureBuffer ? TextureUploadSize : 0);
 
-inline constexpr uint64_t UberStateStagingOffset = StagingBufferSize;
-inline uint64_t allocated_staging_buffer_size() noexcept {
-  return StagingBufferSize + (resources().hybridResources ? UberStateBufferSize : 0);
-}
 const wgpu::Buffer& staging_buffer(size_t slot);
 
 struct RegisteredDrawType {

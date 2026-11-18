@@ -228,7 +228,6 @@ void notify_guest_write(const void* hostPtr, size_t size) noexcept {
 
 namespace {
 std::atomic_bool g_skipUnreadyPipelines = true;
-std::atomic<AuroraShaderMode> g_requestedShaderMode{AURORA_SHADER_SPECIALIZED};
 } // namespace
 
 void aurora_set_frame_worker_wait_callback(AuroraFrameWorkerWaitCallback callback) {
@@ -265,11 +264,6 @@ void aurora_get_present_timing(AuroraPresentTiming* timing) {
     *timing = aurora::gfx::presentation::snapshot_timing();
   }
 }
-
-void aurora_set_shader_mode(AuroraShaderMode mode) {
-  g_requestedShaderMode.store(mode == AURORA_SHADER_HYBRID ? mode : AURORA_SHADER_SPECIALIZED);
-}
-AuroraShaderMode aurora_get_shader_mode() { return g_requestedShaderMode.load(); }
 
 void aurora_set_skip_unready_pipelines(bool enabled) {
   g_skipUnreadyPipelines.store(enabled, std::memory_order_release);
