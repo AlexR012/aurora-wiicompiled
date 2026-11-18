@@ -7,11 +7,15 @@
 #include <dolphin/pad.h>
 #include <dolphin/si.h>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <ranges>
 #include <sys/stat.h>
+#include <tuple>
+#include <vector>
 
 namespace {
 constexpr aurora::Module Log{"aurora::pad"};
@@ -554,7 +558,28 @@ static bool dead_zones_valid(const PADDeadZones& deadZones) {
          deadZones.rightTriggerActivationZone <= SDL_JOYSTICK_AXIS_MAX;
 }
 
+// The PAD API also exposes mutable pointers to these saved fields.
+static std::string mapping_snapshot(const aurora::gamepad::GameController& controller) {
+  std::string bytes;
+  const auto append = [&](const auto& value) {
+    bytes.append(reinterpret_cast<const char*>(&value), sizeof(value));
+  };
+  append(controller.m_deadZones);
+  append(controller.m_buttonMapping);
+  append(controller.m_axisMapping);
+  if (!controller.m_isGameCube) {
+    append(controller.m_rumbleIntensityLow);
+    append(controller.m_rumbleIntensityHigh);
+    append(controller.m_forceDeviceRumble);
+  }
+  return bytes;
+}
+
 void __PADLoadMapping(aurora::gamepad::GameController* controller) /*  NOLINT(*-reserved-identifier) */ {
+  if (controller->m_mappingBaseline && *controller->m_mappingBaseline != mapping_snapshot(*controller)) {
+    controller->m_mappingLoaded = true;
+    return;
+  }
   int32_t playerIndex = aurora::gamepad::player_index(SDL_GetGamepadID(controller->m_controller));
   if (playerIndex < 0 || aurora::g_config.userPath == nullptr) {
     return;
@@ -566,12 +591,18 @@ void __PADLoadMapping(aurora::gamepad::GameController* controller) /*  NOLINT(*-
   }
 
   controller->m_mappingLoaded = true;
+  controller->m_mappingBaseline = mapping_snapshot(*controller);
+  controller->m_mappingNeedsFile = false;
 
   const auto path =
       aurora::io::fs_path_from_string(aurora::g_config.userPath) /
       fmt::format("{}_{:04X}_{:04X}.controller", PADGetName(playerIndex), controller->m_vid, controller->m_pid);
   auto file = aurora::io::open_file(path, "rb");
   if (!file) {
+    std::error_code error;
+    if (!std::filesystem::exists(path, error) && !error) {
+      controller->m_mappingNeedsFile = true;
+    }
     return;
   }
 
@@ -595,6 +626,9 @@ void __PADLoadMapping(aurora::gamepad::GameController* controller) /*  NOLINT(*-
     return;
   }
   const bool isGameCube = isGameCubeValue != 0;
+  if (isGameCube != controller->m_isGameCube) {
+    return;
+  }
   if (isGameCube) {
     if (playerIndex >= PAD_CHANMAX) {
       return;
@@ -603,6 +637,12 @@ void __PADLoadMapping(aurora::gamepad::GameController* controller) /*  NOLINT(*-
     constexpr uint32_t btnSecLen = sizeof(PADButtonMapping) * PAD_BUTTON_COUNT;
     constexpr uint32_t axisSecLen = sizeof(PADAxisMapping) * PAD_AXIS_COUNT;
     const Sint64 portOffset = dataStart + (dzSecLen + btnSecLen + axisSecLen) * playerIndex;
+    const auto size = SDL_GetIOSize(file.get());
+    const auto slotSize = dzSecLen + btnSecLen + axisSecLen;
+    if (size >= dataStart && size <= portOffset && (size - dataStart) % slotSize == 0) {
+      controller->m_mappingNeedsFile = true;
+      return;
+    }
     if (SDL_SeekIO(file.get(), portOffset, SDL_IO_SEEK_SET) != portOffset) {
       Log.warn("Unable to seek in controller bindings! Path: \"{}\"", aurora::io::fs_path_to_string(path));
       return;
@@ -666,6 +706,7 @@ void __PADLoadMapping(aurora::gamepad::GameController* controller) /*  NOLINT(*-
     __PADSetDefaultMapping(controller);
   }
   reset_alt_button_mapping(controller);
+  controller->m_mappingBaseline = mapping_snapshot(*controller);
 }
 
 static void EnsureMappingLoaded(aurora::gamepad::GameController* controller) {
@@ -1256,17 +1297,60 @@ void PADSerializeMappings() {
   }
   const auto basePath = aurora::io::fs_path_from_string(aurora::g_config.userPath);
 
+  struct MappingWrite {
+    aurora::gamepad::GameController* controller;
+    std::string snapshot;
+    bool edited;
+    bool assigned;
+  };
+  std::map<std::pair<std::filesystem::path, int>, std::vector<MappingWrite>> writes;
   for (auto& controller : aurora::gamepad::g_GameControllers | std::views::values) {
     EnsureMappingLoaded(&controller);
-    if (!controller.m_mappingLoaded) {
+    if (!controller.m_mappingBaseline) {
       continue;
+    }
+    auto snapshot = mapping_snapshot(controller);
+    const bool edited = snapshot != *controller.m_mappingBaseline;
+    const int port = aurora::gamepad::player_index(controller.m_index);
+    if (controller.m_isGameCube && (port < 0 || port >= PAD_CHANMAX)) {
+      continue;
+    }
+    if (!edited) {
+      if (!controller.m_mappingNeedsFile) {
+        continue;
+      }
+      if (controller.m_isGameCube) {
+        // Recheck the current slot before publishing defaults after a port change.
+        __PADLoadMapping(&controller);
+        if (!controller.m_mappingNeedsFile) {
+          continue;
+        }
+      }
     }
     const auto filePath =
         basePath / fmt::format("{}_{:04X}_{:04X}.controller", aurora::gamepad::controller_name(controller.m_index),
                                controller.m_vid, controller.m_pid);
+    writes[{filePath, controller.m_isGameCube ? port : -1}].push_back(
+        {&controller, std::move(snapshot), edited, port >= 0});
+  }
+  for (auto& [destination, candidates] : writes) {
+    const auto& [filePath, port] = destination;
+    // Identical pads can share a file. Publish once and prefer the assigned pad's edit.
+    const auto& write = *std::ranges::max_element(candidates, {}, [](const MappingWrite& item) {
+      return std::tuple{item.edited, item.assigned, item.controller->m_index};
+    });
+    const auto& controller = *write.controller;
     const auto filePathStr = aurora::io::fs_path_to_string(filePath);
+    if (!write.edited && !controller.m_isGameCube) {
+      std::error_code error;
+      if (std::filesystem::exists(filePath, error) || error) {
+        continue;
+      }
+    }
 
-    auto file = aurora::io::open_atomic_file(filePath, aurora::io::AtomicFileMode::Preserve);
+    const auto mode =
+        controller.m_isGameCube ? aurora::io::AtomicFileMode::Preserve : aurora::io::AtomicFileMode::Truncate;
+    auto file = aurora::io::open_atomic_file(filePath, mode);
     if (!file) {
       Log.warn("Unable to open controller bindings! Path: \"{}\": {}", filePathStr, SDL_GetError());
       continue;
@@ -1282,11 +1366,6 @@ void PADSerializeMappings() {
     ok = ok && seek_aligned(file.get(), dataStart);
     if (controller.m_isGameCube) {
       // GameCube adapters expose 4 input devices with the same vid/pid, we store all 4 in the same file
-      const auto port = aurora::gamepad::player_index(controller.m_index);
-      if (port < 0 || port >= PAD_CHANMAX) {
-        Log.warn("Unable to write controller bindings for invalid port {}! Path: \"{}\"", port, filePathStr);
-        continue;
-      }
       constexpr int64_t dzSecLen = sizeof(PADDeadZones);
       constexpr int64_t btnSecLen = sizeof(PADButtonMapping) * PAD_BUTTON_COUNT;
       constexpr int64_t axisSecLen = sizeof(PADAxisMapping) * PAD_AXIS_COUNT;
@@ -1305,6 +1384,11 @@ void PADSerializeMappings() {
     }
     if (!ok || !file.commit()) {
       Log.warn("Unable to write controller bindings! Path: \"{}\": {}", filePathStr, SDL_GetError());
+      continue;
+    }
+    for (auto& candidate : candidates) {
+      candidate.controller->m_mappingBaseline = std::move(candidate.snapshot);
+      candidate.controller->m_mappingNeedsFile = false;
     }
   }
 
@@ -1316,6 +1400,7 @@ PADDeadZones* PADGetDeadZones(const u32 port) {
   if (controller == nullptr) {
     return nullptr;
   }
+  EnsureMappingLoaded(controller);
   return &controller->m_deadZones;
 }
 

@@ -12,6 +12,7 @@
 #include <array>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -24,8 +25,23 @@ protected:
     savedPath = aurora::g_config.userPath;
     initialized = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
     ASSERT_TRUE(initialized) << SDL_GetError();
-    directory = std::filesystem::temp_directory_path() / ("aurora-pad-mapping-" + std::to_string(SDL_GetTicksNS()));
-    ASSERT_TRUE(aurora::io::create_directories(directory));
+    SDL_VirtualJoystickDesc probe{};
+    SDL_INIT_INTERFACE(&probe);
+    const auto id = SDL_AttachVirtualJoystick(&probe);
+    if (id == 0 && std::string_view(SDL_GetError()) == "SDL not built with virtual-joystick support") {
+      GTEST_SKIP() << SDL_GetError();
+    }
+    ASSERT_NE(id, 0u) << SDL_GetError();
+    ASSERT_TRUE(SDL_DetachVirtualJoystick(id)) << SDL_GetError();
+    for (unsigned int attempt = 0; directory.empty(); ++attempt) {
+      const auto candidate = std::filesystem::temp_directory_path() /
+          fmt::format("aurora-pad-mapping-{}-{}", SDL_GetTicksNS(), attempt);
+      std::error_code error;
+      if (std::filesystem::create_directory(candidate, error)) {
+        directory = candidate;
+      }
+      ASSERT_FALSE(error) << error.message();
+    }
     path = aurora::io::fs_path_to_string(directory);
     aurora::g_config.userPath = path.c_str();
   }
@@ -40,7 +56,9 @@ protected:
     }
     aurora::g_config.userPath = savedPath;
     std::error_code error;
-    std::filesystem::remove_all(directory, error);
+    if (!directory.empty()) {
+      std::filesystem::remove_all(directory, error);
+    }
     if (initialized) {
       SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     }
@@ -142,11 +160,16 @@ TEST_F(PadMappingTest, NeverAssignedSameModelPadsPreserveSavedBindings) {
   const auto extra = add(-1);
   ASSERT_NE(extra, 0u);
   ASSERT_NE(add(-1), 0u);
-  ASSERT_NE(add(0, false, 0x5679), 0u);
+  const auto assigned = add(0, false, 0x5679);
+  ASSERT_NE(assigned, 0u);
   bind(0, SDL_GAMEPAD_BUTTON_WEST);
   PADSerializeMappings();
   EXPECT_FALSE(aurora::gamepad::g_GameControllers.at(extra).m_mappingLoaded);
   EXPECT_EQ(contents(extra), saved);
+  ASSERT_FALSE(contents(assigned).empty());
+  remove(assigned);
+  ASSERT_NE(add(0, false, 0x5679), 0u);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
 
   aurora::gamepad::set_player_index(extra, 1);
   expect_binding(1, SDL_GAMEPAD_BUTTON_NORTH);
@@ -167,6 +190,121 @@ TEST_F(PadMappingTest, LoadedBindingsSurviveNoneAndReconnect) {
   PADSerializeMappings();
   EXPECT_EQ(contents(reconnected), saved);
   aurora::gamepad::set_player_index(reconnected, 0);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
+}
+
+TEST_F(PadMappingTest, UnsavedEditSurvivesRemapAndUnassignment) {
+  const auto id = add(0);
+  ASSERT_NE(id, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_NORTH);
+  PADSerializeMappings();
+  bind(0, SDL_GAMEPAD_BUTTON_WEST);
+  ASSERT_TRUE(aurora::gamepad::refresh_controller(id));
+  aurora::gamepad::set_player_index(id, -1);
+  PADSerializeMappings();
+  remove(id);
+  ASSERT_NE(add(0), 0u);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
+}
+
+TEST_F(PadMappingTest, ReassignedPadWinsSharedFileOnRepeatedSaves) {
+  const auto oldPad = add(0);
+  ASSERT_NE(oldPad, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_NORTH);
+  PADSerializeMappings();
+  bind(0, SDL_GAMEPAD_BUTTON_EAST);
+  aurora::gamepad::set_player_index(oldPad, -1);
+  const auto newPad = add(0);
+  ASSERT_NE(newPad, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_WEST);
+  PADSerializeMappings();
+  PADSerializeMappings();
+  remove(oldPad);
+  remove(newPad);
+  ASSERT_NE(add(0), 0u);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
+}
+
+TEST_F(PadMappingTest, IncompleteMappingIsPreserved) {
+  const auto id = add(0);
+  ASSERT_NE(id, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_WEST);
+  PADSerializeMappings();
+  auto bytes = contents(id);
+  ASSERT_GT(bytes.size(), 32u);
+  bytes.resize(33);
+  const auto file = directory / fmt::format("{}_1234_5678.controller", aurora::gamepad::controller_name(id));
+  ASSERT_TRUE(aurora::io::write_file(file, bytes));
+  remove(id);
+  const auto replacement = add(0);
+  ASSERT_NE(replacement, 0u);
+  PADSerializeMappings();
+  EXPECT_EQ(contents(replacement), bytes);
+  bind(0, SDL_GAMEPAD_BUTTON_EAST);
+  PADSerializeMappings();
+  remove(replacement);
+  ASSERT_NE(add(0), 0u);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_EAST);
+}
+
+TEST_F(PadMappingTest, FailedPublishRetainsTheAssignedEditForRetry) {
+  const auto oldPad = add(0);
+  ASSERT_NE(oldPad, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_NORTH);
+  PADSerializeMappings();
+  bind(0, SDL_GAMEPAD_BUTTON_EAST);
+  aurora::gamepad::set_player_index(oldPad, -1);
+  const auto newPad = add(0);
+  ASSERT_NE(newPad, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_WEST);
+  const auto file = directory / fmt::format("{}_1234_5678.controller", aurora::gamepad::controller_name(newPad));
+  const auto backup = directory / "saved";
+  std::filesystem::rename(file, backup);
+  ASSERT_TRUE(std::filesystem::create_directories(file / "occupied"));
+  PADSerializeMappings();
+  ASSERT_TRUE(std::filesystem::is_directory(file / "occupied"));
+  std::filesystem::remove_all(file);
+  std::filesystem::rename(backup, file);
+  PADSerializeMappings();
+  remove(oldPad);
+  remove(newPad);
+  ASSERT_NE(add(0), 0u);
+  expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
+}
+
+TEST_F(PadMappingTest, FirstDeadZoneEditReplacesAnInvalidStandardMapping) {
+  const auto id = add(0);
+  ASSERT_NE(id, 0u);
+  const auto file = directory / fmt::format("{}_1234_5678.controller", aurora::gamepad::controller_name(id));
+  const std::vector<uint8_t> invalid(4096, 0xff);
+  ASSERT_TRUE(aurora::io::write_file(file, invalid));
+  auto* zones = PADGetDeadZones(0);
+  ASSERT_NE(zones, nullptr);
+  zones->stickDeadZone = 5432;
+  PADSerializeMappings();
+  EXPECT_LT(contents(id).size(), invalid.size());
+  remove(id);
+  ASSERT_NE(add(0), 0u);
+  zones = PADGetDeadZones(0);
+  ASSERT_NE(zones, nullptr);
+  EXPECT_EQ(zones->stickDeadZone, 5432);
+}
+
+TEST_F(PadMappingTest, MissingAdapterSlotDoesNotOverwriteOccupiedSlotAfterMove) {
+  const auto first = add(0, true);
+  ASSERT_NE(first, 0u);
+  bind(0, SDL_GAMEPAD_BUTTON_WEST);
+  PADSerializeMappings();
+  const auto saved = contents(first);
+  ASSERT_FALSE(saved.empty());
+  remove(first);
+  const auto moved = add(1, true);
+  ASSERT_NE(moved, 0u);
+  u32 count = 0;
+  ASSERT_NE(PADGetButtonMappings(1, &count), nullptr);
+  aurora::gamepad::set_player_index(moved, 0);
+  PADSerializeMappings();
+  EXPECT_EQ(contents(moved), saved);
   expect_binding(0, SDL_GAMEPAD_BUTTON_WEST);
 }
 
