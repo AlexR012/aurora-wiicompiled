@@ -14,6 +14,7 @@ void reset_texture_stubs();
 uint64_t texture_allocations();
 uint64_t palette_conversions();
 uint64_t copy_allocations();
+void set_guest_write_generation(uint64_t generation);
 gfx::TextureHandle make_texture_handle(uint32_t width, uint32_t height, u32 format = GX_TF_RGBA8_PC);
 void set_replacement(gfx::TextureHandle handle, uint64_t id = 1);
 void set_source_replacement(aurora::texture::TextureSourceKey key, gfx::TextureHandle handle);
@@ -79,16 +80,61 @@ TEST_F(GxTextureCacheTest, ReusesIdenticalContentAtDifferentAddresses) {
 }
 
 TEST_F(GxTextureCacheTest, ObjectHitDoesNotHashAgain) {
+  testing::set_guest_write_generation(0);
   std::array<uint8_t, 16> pixels{};
   const auto obj = make_texture(pixels.data(), 1);
   texture::resolve_static_texture(obj);
   const uint64_t hashedBytes = texture_stats().hashedBytes;
 
+  texture::invalidate_sources();
   texture::resolve_static_texture(obj);
 
   EXPECT_EQ(texture_stats().hashedBytes, hashedBytes);
   EXPECT_EQ(texture_stats().objectHits, 1);
   EXPECT_EQ(testing::texture_allocations(), 1);
+}
+
+TEST_F(GxTextureCacheTest, UntrackedObjectDetectsChangedBytes) {
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  const auto first = texture::resolve_static_texture(obj);
+
+  pixels[7] = 1;
+  texture::invalidate_sources();
+
+  EXPECT_NE(texture::resolve_static_texture(obj), first);
+  EXPECT_EQ(testing::texture_allocations(), 2);
+}
+
+TEST_F(GxTextureCacheTest, NewGenerationWithUnchangedPixelsReusesObject) {
+  testing::set_guest_write_generation(0);
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  const auto first = texture::resolve_static_texture(obj);
+  const auto hashed = texture_stats().hashedBytes;
+  const auto hits = texture_stats().objectHits;
+
+  testing::set_guest_write_generation(1);
+  texture::invalidate_sources();
+
+  EXPECT_EQ(texture::resolve_static_texture(obj), first);
+  EXPECT_GT(texture_stats().hashedBytes, hashed);
+  EXPECT_EQ(texture_stats().objectHits, hits + 1);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+}
+
+TEST_F(GxTextureCacheTest, TrackedObjectDetectsChangedGeneration) {
+  testing::set_guest_write_generation(0);
+  std::array<uint8_t, 16> pixels{};
+  const auto obj = make_texture(pixels.data(), 1);
+  const auto first = texture::resolve_static_texture(obj);
+
+  pixels[7] = 1;
+  testing::set_guest_write_generation(1);
+  texture::invalidate_sources();
+
+  EXPECT_NE(texture::resolve_static_texture(obj), first);
+  EXPECT_EQ(testing::texture_allocations(), 2);
 }
 
 TEST_F(GxTextureCacheTest, ChangedContentAndMetadataMiss) {
@@ -520,6 +566,7 @@ TEST_F(GxTextureCacheTest, ObjectAgingKeepsContentEntry) {
 }
 
 TEST_F(GxTextureCacheTest, BoundObjectIsNotAgedOut) {
+  testing::set_guest_write_generation(0);
   std::array<uint8_t, 16> pixels{};
   g_gxState.loadedTextures[0] = make_texture(pixels.data(), 1);
   ShaderInfo info{};

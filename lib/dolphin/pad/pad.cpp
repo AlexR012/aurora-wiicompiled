@@ -7,17 +7,24 @@
 #include <dolphin/pad.h>
 #include <dolphin/si.h>
 
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <ranges>
 #include <sys/stat.h>
+#include <tuple>
+#include <vector>
 
 namespace {
 constexpr aurora::Module Log{"aurora::pad"};
 
 constexpr int32_t k_mappingsFileVersion = 4;
 constexpr int32_t k_minMappingsFileVersion = 3;
+constexpr Sint64 k_adapterSlotSize = sizeof(PADDeadZones) + sizeof(PADButtonMapping) * PAD_BUTTON_COUNT +
+                                    sizeof(PADAxisMapping) * PAD_AXIS_COUNT;
 
 std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsStandard{{
     {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_A},
@@ -554,67 +561,139 @@ static bool dead_zones_valid(const PADDeadZones& deadZones) {
          deadZones.rightTriggerActivationZone <= SDL_JOYSTICK_AXIS_MAX;
 }
 
-void __PADLoadMapping(aurora::gamepad::GameController* controller) /*  NOLINT(*-reserved-identifier) */ {
-  int32_t playerIndex = aurora::gamepad::player_index(SDL_GetGamepadID(controller->m_controller));
-  if (playerIndex < 0 || aurora::g_config.userPath == nullptr) {
-    return;
+using aurora::gamepad::ControllerMapping;
+using aurora::gamepad::GameController;
+using aurora::gamepad::MappingReadResult;
+using MappingDestination = std::pair<std::filesystem::path, int>;
+
+// Mutable PAD getters can edit any individual field in place.
+static bool apply_mapping_edits(ControllerMapping& target, const ControllerMapping& baseline,
+                                const ControllerMapping& current, bool isGameCube) {
+  bool edited = false;
+  const auto apply = [&](auto& destination, auto before, auto after) {
+    if (before != after) {
+      destination = after;
+      edited = true;
+    }
+  };
+  auto& zones = target.m_deadZones;
+  const auto& beforeZones = baseline.m_deadZones;
+  const auto& afterZones = current.m_deadZones;
+  apply(zones.emulateTriggers, beforeZones.emulateTriggers, afterZones.emulateTriggers);
+  apply(zones.useDeadzones, beforeZones.useDeadzones, afterZones.useDeadzones);
+  apply(zones.stickDeadZone, beforeZones.stickDeadZone, afterZones.stickDeadZone);
+  apply(zones.substickDeadZone, beforeZones.substickDeadZone, afterZones.substickDeadZone);
+  apply(zones.leftTriggerActivationZone, beforeZones.leftTriggerActivationZone, afterZones.leftTriggerActivationZone);
+  apply(zones.rightTriggerActivationZone, beforeZones.rightTriggerActivationZone, afterZones.rightTriggerActivationZone);
+  const auto savedButtons = target.m_buttonMapping;
+  for (size_t i = 0; i < PAD_BUTTON_COUNT; ++i) {
+    const auto& before = baseline.m_buttonMapping[i];
+    const auto& after = current.m_buttonMapping[i];
+    if (before.nativeButton == after.nativeButton && before.padButton == after.padButton) {
+      continue;
+    }
+    const auto saved = std::ranges::find(savedButtons, before.padButton, &PADButtonMapping::padButton);
+    const auto index = saved == savedButtons.end() ? i : static_cast<size_t>(saved - savedButtons.begin());
+    auto& button = target.m_buttonMapping[index];
+    apply(button.nativeButton, before.nativeButton, after.nativeButton);
+    apply(button.padButton, before.padButton, after.padButton);
   }
-
-  if (!controller->m_mappingLoaded) {
-    __PADSetDefaultMapping(controller);
-    controller->m_axisMapping = g_defaultAxes;
+  for (size_t i = 0; i < PAD_AXIS_COUNT; ++i) {
+    auto& axis = target.m_axisMapping[i];
+    const auto& before = baseline.m_axisMapping[i];
+    const auto& after = current.m_axisMapping[i];
+    apply(axis.nativeAxis.nativeAxis, before.nativeAxis.nativeAxis, after.nativeAxis.nativeAxis);
+    apply(axis.nativeAxis.sign, before.nativeAxis.sign, after.nativeAxis.sign);
+    apply(axis.nativeButton, before.nativeButton, after.nativeButton);
+    apply(axis.padAxis, before.padAxis, after.padAxis);
   }
+  if (!isGameCube) {
+    apply(target.m_rumbleIntensityLow, baseline.m_rumbleIntensityLow, current.m_rumbleIntensityLow);
+    apply(target.m_rumbleIntensityHigh, baseline.m_rumbleIntensityHigh, current.m_rumbleIntensityHigh);
+    apply(target.m_forceDeviceRumble, baseline.m_forceDeviceRumble, current.m_forceDeviceRumble);
+  }
+  return edited;
+}
 
-  controller->m_mappingLoaded = true;
+static bool mapping_edited(const GameController& controller) {
+  if (!controller.m_mappingBaseline) {
+    return false;
+  }
+  auto mapping = *controller.m_mappingBaseline;
+  return apply_mapping_edits(mapping, *controller.m_mappingBaseline, controller, controller.m_isGameCube);
+}
 
-  const auto path =
-      aurora::io::fs_path_from_string(aurora::g_config.userPath) /
-      fmt::format("{}_{:04X}_{:04X}.controller", PADGetName(playerIndex), controller->m_vid, controller->m_pid);
+static std::filesystem::path mapping_path(const std::filesystem::path& base, const GameController& controller) {
+  return base / fmt::format("{}_{:04X}_{:04X}.controller", aurora::gamepad::controller_name(controller.m_index),
+                           controller.m_vid, controller.m_pid);
+}
+
+static MappingReadResult read_mapping(const std::filesystem::path& path, int port, const GameController& controller,
+                                      ControllerMapping& mapping) {
+  std::error_code error;
+  const auto status = std::filesystem::status(path, error);
+  if (status.type() == std::filesystem::file_type::not_found) {
+    return MappingReadResult::Missing;
+  }
+  if (error || !std::filesystem::is_regular_file(status)) {
+    return MappingReadResult::Retry;
+  }
   auto file = aurora::io::open_file(path, "rb");
   if (!file) {
-    return;
+    return MappingReadResult::Retry;
   }
+  const auto failed_read = [&] {
+    return SDL_GetIOStatus(file.get()) == SDL_IO_STATUS_EOF ? MappingReadResult::Invalid : MappingReadResult::Retry;
+  };
 
   uint32_t magic = 0;
-  if (!SDL_ReadU32LE(file.get(), &magic) || magic != SBIG('CTRL')) {
+  if (!SDL_ReadU32LE(file.get(), &magic)) {
+    return failed_read();
+  }
+  if (magic != SBIG('CTRL')) {
     Log.warn("Invalid controller mapping magic!");
-    return;
+    return MappingReadResult::Invalid;
   }
 
   uint32_t version = 0;
-  if (!SDL_ReadU32LE(file.get(), &version) || version < k_minMappingsFileVersion || version > k_mappingsFileVersion) {
+  if (!SDL_ReadU32LE(file.get(), &version)) {
+    return failed_read();
+  }
+  if (version < k_minMappingsFileVersion || version > k_mappingsFileVersion) {
     Log.warn("Invalid controller mapping version! (Expected {0}..{1}, found {2})", k_minMappingsFileVersion,
              k_mappingsFileVersion, version);
-    return;
+    return MappingReadResult::Invalid;
   }
 
   uint8_t isGameCubeValue = 0;
   Sint64 dataStart = 0;
-  if (!SDL_ReadU8(file.get(), &isGameCubeValue) || !seek_aligned(file.get(), dataStart)) {
+  if (!SDL_ReadU8(file.get(), &isGameCubeValue)) {
+    return failed_read();
+  }
+  if (!seek_aligned(file.get(), dataStart)) {
     Log.warn("Unable to read controller bindings header! Path: \"{}\"", aurora::io::fs_path_to_string(path));
-    return;
+    return MappingReadResult::Retry;
   }
   const bool isGameCube = isGameCubeValue != 0;
+  if (isGameCube != controller.m_isGameCube) {
+    return MappingReadResult::Invalid;
+  }
   if (isGameCube) {
-    if (playerIndex >= PAD_CHANMAX) {
-      return;
+    const Sint64 portOffset = dataStart + k_adapterSlotSize * port;
+    const auto size = SDL_GetIOSize(file.get());
+    if (size < 0) {
+      return MappingReadResult::Retry;
     }
-    constexpr uint32_t dzSecLen = sizeof(PADDeadZones);
-    constexpr uint32_t btnSecLen = sizeof(PADButtonMapping) * PAD_BUTTON_COUNT;
-    constexpr uint32_t axisSecLen = sizeof(PADAxisMapping) * PAD_AXIS_COUNT;
-    const Sint64 portOffset = dataStart + (dzSecLen + btnSecLen + axisSecLen) * playerIndex;
+    if (size >= dataStart && size <= portOffset && (size - dataStart) % k_adapterSlotSize == 0) {
+      return MappingReadResult::Missing;
+    }
     if (SDL_SeekIO(file.get(), portOffset, SDL_IO_SEEK_SET) != portOffset) {
       Log.warn("Unable to seek in controller bindings! Path: \"{}\"", aurora::io::fs_path_to_string(path));
-      return;
+      return MappingReadResult::Retry;
     }
   }
 
-  auto deadZones = controller->m_deadZones;
-  auto buttonMapping = controller->m_buttonMapping;
-  auto axisMapping = controller->m_axisMapping;
-  auto rumbleIntensityLow = controller->m_rumbleIntensityLow;
-  auto rumbleIntensityHigh = controller->m_rumbleIntensityHigh;
-  auto forceDeviceRumble = controller->m_forceDeviceRumble;
+  auto [deadZones, buttonMapping, axisMapping, rumbleIntensityLow, rumbleIntensityHigh, forceDeviceRumble] = mapping;
   bool ok = aurora::io::read_exact(file.get(), &deadZones, sizeof(deadZones)) &&
             aurora::io::read_exact(file.get(), buttonMapping.data(), sizeof(buttonMapping)) &&
             aurora::io::read_exact(file.get(), axisMapping.data(), sizeof(axisMapping));
@@ -628,50 +707,83 @@ void __PADLoadMapping(aurora::gamepad::GameController* controller) /*  NOLINT(*-
   }
   if (!ok) {
     Log.warn("Unable to read controller bindings! Path: \"{}\"", aurora::io::fs_path_to_string(path));
-    return;
+    return failed_read();
   }
-  if (dead_zones_valid(deadZones)) {
-    controller->m_deadZones = deadZones;
-  } else {
-    Log.warn("__PADLoadMapping port={}: invalid deadzone data in file, keeping defaults", playerIndex);
+  if (isGameCube) {
+    // Writing a later adapter port can leave zero-filled holes for earlier ports.
+    static constexpr std::array<unsigned char, k_adapterSlotSize> emptySlot{};
+    if (std::memcmp(&deadZones, emptySlot.data(), sizeof(deadZones)) == 0 &&
+        std::memcmp(buttonMapping.data(), emptySlot.data(), sizeof(buttonMapping)) == 0 &&
+        std::memcmp(axisMapping.data(), emptySlot.data(), sizeof(axisMapping)) == 0) {
+      return MappingReadResult::Missing;
+    }
   }
-  controller->m_buttonMapping = buttonMapping;
-  controller->m_axisMapping = axisMapping;
-  controller->m_rumbleIntensityLow = rumbleIntensityLow;
-  controller->m_rumbleIntensityHigh = rumbleIntensityHigh;
-  controller->m_forceDeviceRumble = forceDeviceRumble;
+  if (!dead_zones_valid(deadZones)) {
+    Log.warn("__PADLoadMapping port={}: invalid deadzone data in file, keeping defaults", port);
+    deadZones = mapping.m_deadZones;
+  }
 
   bool axisCorrupt = false;
   for (uint32_t i = 0; i < PAD_AXIS_COUNT; ++i) {
-    if (controller->m_axisMapping[i].padAxis != static_cast<PADAxis>(i) ||
-        !is_valid_native_axis(controller->m_axisMapping[i].nativeAxis)) {
+    if (axisMapping[i].padAxis != static_cast<PADAxis>(i) || !is_valid_native_axis(axisMapping[i].nativeAxis)) {
       axisCorrupt = true;
       break;
     }
   }
   if (axisCorrupt) {
-    Log.warn("__PADLoadMapping port={}: corrupt axis data in file, resetting axes to defaults", playerIndex);
-    controller->m_axisMapping = g_defaultAxes;
+    Log.warn("__PADLoadMapping port={}: corrupt axis data in file, resetting axes to defaults", port);
+    axisMapping = g_defaultAxes;
   }
 
   bool buttonCorrupt = false;
   for (uint32_t i = 0; i < PAD_BUTTON_COUNT; ++i) {
-    if (controller->m_buttonMapping[i].padButton == 0) {
+    if (buttonMapping[i].padButton == 0) {
       buttonCorrupt = true;
       break;
     }
   }
   if (buttonCorrupt) {
-    Log.warn("__PADLoadMapping port={}: corrupt button data in file, resetting buttons to defaults", playerIndex);
-    __PADSetDefaultMapping(controller);
+    Log.warn("__PADLoadMapping port={}: corrupt button data in file, resetting buttons to defaults", port);
+    buttonMapping = aurora::pad::detail::default_buttons(controller);
   }
-  reset_alt_button_mapping(controller);
+  mapping = {deadZones, buttonMapping, axisMapping, rumbleIntensityLow, rumbleIntensityHigh, forceDeviceRumble};
+  return MappingReadResult::Loaded;
 }
 
 static void EnsureMappingLoaded(aurora::gamepad::GameController* controller) {
-  if (!controller->m_mappingLoaded) {
-    __PADLoadMapping(controller);
+  if (controller->m_mappingLoaded && !controller->m_isGameCube) {
+    return;
   }
+  const int port = aurora::gamepad::player_index(controller->m_index);
+  const bool adapterMoved = controller->m_isGameCube && port != controller->m_mappingPort;
+  if (controller->m_mappingLoaded && !adapterMoved) {
+    return;
+  }
+  if (mapping_edited(*controller)) {
+    controller->m_mappingLoaded = true;
+    return;
+  }
+  if (port < 0 || (controller->m_isGameCube && port >= PAD_CHANMAX) || aurora::g_config.userPath == nullptr) {
+    return;
+  }
+
+  auto& mapping = static_cast<ControllerMapping&>(*controller);
+  auto loaded = mapping;
+  if (adapterMoved && controller->m_mappingBaseline) {
+    loaded = ControllerMapping{};
+    loaded.m_deadZones.emulateTriggers = false;
+  }
+  if (!controller->m_mappingLoaded || adapterMoved) {
+    loaded.m_buttonMapping = aurora::pad::detail::default_buttons(*controller);
+    loaded.m_axisMapping = g_defaultAxes;
+  }
+  const auto path = mapping_path(aurora::io::fs_path_from_string(aurora::g_config.userPath), *controller);
+  controller->m_mappingReadResult = read_mapping(path, port, *controller, loaded);
+  controller->m_mappingBaseline = loaded;
+  mapping = loaded;
+  reset_alt_button_mapping(controller);
+  controller->m_mappingPort = port;
+  controller->m_mappingLoaded = true;
 }
 
 void aurora::pad::detail::ensure_mapping_loaded(gamepad::GameController* controller) {
@@ -941,6 +1053,7 @@ void PADSetButtonMapping(const u32 port, const PADButtonMapping mapping) {
   if (controller == nullptr) {
     return;
   }
+  EnsureMappingLoaded(controller);
 
   const auto iter = std::ranges::find_if(controller->m_buttonMapping,
                                          [mapping](const auto& pair) { return mapping.padButton == pair.padButton; });
@@ -999,6 +1112,7 @@ void PADSetAxisMapping(const u32 port, const PADAxisMapping mapping) {
   if (controller == nullptr) {
     return;
   }
+  EnsureMappingLoaded(controller);
 
   const auto iter = std::ranges::find_if(controller->m_axisMapping,
                                          [mapping](const auto& pair) { return mapping.padAxis == pair.padAxis; });
@@ -1256,14 +1370,58 @@ void PADSerializeMappings() {
   }
   const auto basePath = aurora::io::fs_path_from_string(aurora::g_config.userPath);
 
+  struct MappingWrite {
+    GameController* controller;
+    bool edited;
+    bool assigned;
+  };
+  std::map<MappingDestination, std::vector<MappingWrite>> writes;
   for (auto& controller : aurora::gamepad::g_GameControllers | std::views::values) {
     EnsureMappingLoaded(&controller);
-    const auto filePath =
-        basePath / fmt::format("{}_{:04X}_{:04X}.controller", aurora::gamepad::controller_name(controller.m_index),
-                               controller.m_vid, controller.m_pid);
-    const auto filePathStr = aurora::io::fs_path_to_string(filePath);
+    if (!controller.m_mappingBaseline) {
+      continue;
+    }
+    const bool edited = mapping_edited(controller);
+    const int port = aurora::gamepad::player_index(controller.m_index);
+    if (controller.m_isGameCube && (port < 0 || port >= PAD_CHANMAX)) {
+      continue;
+    }
+    if (!edited && controller.m_mappingReadResult != MappingReadResult::Missing &&
+        controller.m_mappingReadResult != MappingReadResult::Retry) {
+      continue;
+    }
+    writes[{mapping_path(basePath, controller), controller.m_isGameCube ? port : -1}].push_back(
+        {&controller, edited, port >= 0});
+  }
+  for (auto& [destination, candidates] : writes) {
+    const auto& [filePath, port] = destination;
+    // Identical pads can share a file. Publish once and prefer the assigned pad's edit.
+    const auto& write = *std::ranges::max_element(candidates, {}, [](const MappingWrite& item) {
+      return std::tuple{item.edited, item.assigned, item.controller->m_index};
+    });
+    auto& controller = *write.controller;
+    auto mapping = *controller.m_mappingBaseline;
+    const auto result =
+        read_mapping(filePath, controller.m_isGameCube ? port : controller.m_mappingPort, controller, mapping);
+    if (result == MappingReadResult::Retry) {
+      continue;
+    }
+    if (!write.edited && result != MappingReadResult::Missing) {
+      static_cast<ControllerMapping&>(controller) = mapping;
+      controller.m_mappingBaseline = mapping;
+      controller.m_mappingReadResult = result;
+      continue;
+    }
+    if (result == MappingReadResult::Loaded) {
+      apply_mapping_edits(mapping, *controller.m_mappingBaseline, controller, controller.m_isGameCube);
+    } else {
+      mapping = controller;
+    }
 
-    auto file = aurora::io::open_atomic_file(filePath, aurora::io::AtomicFileMode::Preserve);
+    const auto filePathStr = aurora::io::fs_path_to_string(filePath);
+    const auto mode =
+        controller.m_isGameCube ? aurora::io::AtomicFileMode::Preserve : aurora::io::AtomicFileMode::Truncate;
+    auto file = aurora::io::open_atomic_file(filePath, mode);
     if (!file) {
       Log.warn("Unable to open controller bindings! Path: \"{}\": {}", filePathStr, SDL_GetError());
       continue;
@@ -1279,29 +1437,33 @@ void PADSerializeMappings() {
     ok = ok && seek_aligned(file.get(), dataStart);
     if (controller.m_isGameCube) {
       // GameCube adapters expose 4 input devices with the same vid/pid, we store all 4 in the same file
-      const auto port = aurora::gamepad::player_index(controller.m_index);
-      if (port < 0 || port >= PAD_CHANMAX) {
-        Log.warn("Unable to write controller bindings for invalid port {}! Path: \"{}\"", port, filePathStr);
-        continue;
-      }
-      constexpr int64_t dzSecLen = sizeof(PADDeadZones);
-      constexpr int64_t btnSecLen = sizeof(PADButtonMapping) * PAD_BUTTON_COUNT;
-      constexpr int64_t axisSecLen = sizeof(PADAxisMapping) * PAD_AXIS_COUNT;
-      // skip to offset in file for this particular port
-      const Sint64 portOffset = dataStart + (dzSecLen + btnSecLen + axisSecLen) * port;
+      const Sint64 portOffset = dataStart + k_adapterSlotSize * port;
       ok = ok && SDL_SeekIO(file.get(), portOffset, SDL_IO_SEEK_SET) == portOffset;
     }
-    ok = ok && aurora::io::write_exact(file.get(), &controller.m_deadZones, sizeof(controller.m_deadZones)) &&
-         aurora::io::write_exact(file.get(), controller.m_buttonMapping.data(), sizeof(controller.m_buttonMapping)) &&
-         aurora::io::write_exact(file.get(), controller.m_axisMapping.data(), sizeof(controller.m_axisMapping));
+    ok = ok && aurora::io::write_exact(file.get(), &mapping.m_deadZones, sizeof(mapping.m_deadZones)) &&
+         aurora::io::write_exact(file.get(), mapping.m_buttonMapping.data(), sizeof(mapping.m_buttonMapping)) &&
+         aurora::io::write_exact(file.get(), mapping.m_axisMapping.data(), sizeof(mapping.m_axisMapping));
 
     if (!controller.m_isGameCube) {
-      ok = ok && SDL_WriteU16LE(file.get(), controller.m_rumbleIntensityLow) &&
-           SDL_WriteU16LE(file.get(), controller.m_rumbleIntensityHigh) &&
-           SDL_WriteU8(file.get(), controller.m_forceDeviceRumble);
+      ok = ok && SDL_WriteU16LE(file.get(), mapping.m_rumbleIntensityLow) &&
+           SDL_WriteU16LE(file.get(), mapping.m_rumbleIntensityHigh) &&
+           SDL_WriteU8(file.get(), mapping.m_forceDeviceRumble);
     }
     if (!ok || !file.commit()) {
       Log.warn("Unable to write controller bindings! Path: \"{}\": {}", filePathStr, SDL_GetError());
+      continue;
+    }
+    for (const auto& candidate : candidates) {
+      auto& pad = *candidate.controller;
+      auto& current = static_cast<ControllerMapping&>(pad);
+      if (&pad == &controller || pad.m_mappingReadResult != MappingReadResult::Loaded) {
+        current = mapping;
+      }
+      pad.m_mappingBaseline = current;
+      pad.m_mappingReadResult = MappingReadResult::Loaded;
+      if (pad.m_isGameCube) {
+        pad.m_mappingPort = port;
+      }
     }
   }
 
@@ -1313,6 +1475,7 @@ PADDeadZones* PADGetDeadZones(const u32 port) {
   if (controller == nullptr) {
     return nullptr;
   }
+  EnsureMappingLoaded(controller);
   return &controller->m_deadZones;
 }
 
@@ -1442,6 +1605,7 @@ void PADRestoreDefaultMapping(const u32 port) {
   if (controller == nullptr) {
     return;
   }
+  EnsureMappingLoaded(controller);
   __PADSetDefaultMapping(controller);
   controller->m_axisMapping = g_defaultAxes;
 }

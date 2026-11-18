@@ -209,7 +209,7 @@ TEST(ReadbackLayout, Rgba6QuantizesRawColorOnly) {
 constexpr auto ColorFormat = wgpu::TextureFormat::RGBA8Unorm;
 constexpr auto DepthFormat = wgpu::TextureFormat::Depth32Float;
 constexpr uint32_t EfbWidth = 640;
-constexpr uint32_t EfbHeight = 480;
+constexpr uint32_t EfbHeight = 528;
 
 webgpu::TextureWithSampler create_target(wgpu::TextureFormat format, wgpu::TextureUsage usage, uint32_t width,
                                          uint32_t height, const char* label) {
@@ -325,7 +325,8 @@ protected:
     gx::texture::end_frame();
     gfx::finish();
     std::promise<void> submitted;
-    gfx::end_frame([&](wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> callbacks) {
+    gfx::end_frame([&](wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> callbacks,
+                      const gfx::InterpolationReplay&) {
       const auto commands = encoder.Finish();
       webgpu::g_queue.Submit(1, &commands);
       for (auto& callback : callbacks) {

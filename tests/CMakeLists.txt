@@ -64,17 +64,19 @@ gtest_discover_tests(input_tests)
 
 add_executable(pad_adapter_tests
   pad_adapter_test.cpp
+  pad_mapping_test.cpp
 )
 target_include_directories(pad_adapter_tests PRIVATE
   ../include
   ../lib
 )
-target_link_libraries(pad_adapter_tests PRIVATE aurora::pad gtest gtest_main)
+target_link_libraries(pad_adapter_tests PRIVATE aurora::pad absl::flat_hash_map gtest gtest_main)
 if (AURORA_ENABLE_GX)
-  target_link_libraries(pad_adapter_tests PRIVATE aurora::gx aurora::vi)
+  set(aurora_test_renderer_libs aurora::gx aurora::vi)
   if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_libraries(pad_adapter_tests PRIVATE $<LINK_GROUP:RESCAN,aurora::gx,aurora::vi,aurora::core>)
+    set(aurora_test_renderer_libs $<LINK_GROUP:RESCAN,aurora::gx,aurora::vi,aurora::core>)
   endif ()
+  target_link_libraries(pad_adapter_tests PRIVATE ${aurora_test_renderer_libs})
 endif ()
 aurora_copy_runtime_dlls(pad_adapter_tests)
 gtest_discover_tests(pad_adapter_tests)
@@ -203,8 +205,7 @@ if (AURORA_ENABLE_GX)
   )
   target_compile_definitions(texture_replacement_streaming_tests PRIVATE AURORA TARGET_PC=1)
   target_link_libraries(texture_replacement_streaming_tests PRIVATE
-    aurora::gx
-    aurora::vi
+    ${aurora_test_renderer_libs}
     gtest
     gtest_main
   )
@@ -240,8 +241,7 @@ if (AURORA_ENABLE_GX)
   )
   target_compile_definitions(gfx_recording_tests PRIVATE AURORA TARGET_PC=1)
   target_link_libraries(gfx_recording_tests PRIVATE
-    aurora::gx
-    aurora::vi
+    ${aurora_test_renderer_libs}
     absl::flat_hash_map
     gtest
     gtest_main
@@ -258,8 +258,7 @@ if (AURORA_ENABLE_GX)
   )
   target_compile_definitions(gfx_readback_tests PRIVATE AURORA TARGET_PC=1)
   target_link_libraries(gfx_readback_tests PRIVATE
-    aurora::gx
-    aurora::vi
+    ${aurora_test_renderer_libs}
     absl::flat_hash_map
     gtest
     gtest_main
