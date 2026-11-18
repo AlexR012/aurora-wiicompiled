@@ -1719,7 +1719,7 @@ TEST_F(GXFifoTest, SetArray_Pos_EncodesAuroraArrayBaseAndStride) {
   u8 posData[32]{};
   u8 oldData[8]{};
 
-  GXSetArray(GX_VA_POS, posData, sizeof(posData), 12, false);
+  GXSetArray(GX_VA_POS, posData, sizeof(posData), 12);
   auto bytes = capture_fifo();
 
   ASSERT_EQ(bytes.size(), 22u);
