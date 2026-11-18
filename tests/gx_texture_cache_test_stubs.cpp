@@ -1,5 +1,6 @@
 #include "gx/texture.hpp"
 
+#include "gfx/presentation.hpp"
 #include "gfx/tex_palette_conv.hpp"
 #include "gfx/tex_copy_conv.hpp"
 #include "gfx/texture_convert.hpp"
@@ -16,6 +17,7 @@ namespace {
 uint64_t s_textureAllocations = 0;
 uint64_t s_paletteConversions = 0;
 uint64_t s_copyAllocations = 0;
+uint64_t s_guestWriteGeneration = AURORA_GUEST_WRITE_UNTRACKED;
 aurora::gfx::TextureHandle s_replacement;
 std::optional<aurora::texture::TextureSourceKey> s_sourceKey;
 aurora::gfx::TextureHandle s_sourceReplacement;
@@ -50,6 +52,7 @@ void reset_texture_stubs() {
   s_textureAllocations = 0;
   s_paletteConversions = 0;
   s_copyAllocations = 0;
+  s_guestWriteGeneration = AURORA_GUEST_WRITE_UNTRACKED;
   s_replacement.reset();
   s_sourceKey.reset();
   s_sourceReplacement.reset();
@@ -60,6 +63,7 @@ void reset_texture_stubs() {
 uint64_t texture_allocations() { return s_textureAllocations; }
 uint64_t palette_conversions() { return s_paletteConversions; }
 uint64_t copy_allocations() { return s_copyAllocations; }
+void set_guest_write_generation(uint64_t generation) { s_guestWriteGeneration = generation; }
 void set_replacement(gfx::TextureHandle handle, uint64_t id) {
   s_replacement = std::move(handle);
   s_replacementId = id;
@@ -73,6 +77,10 @@ void set_source_replacement(aurora::texture::TextureSourceKey key, gfx::TextureH
 } // namespace aurora::gx
 
 namespace aurora::gfx {
+namespace presentation {
+uint64_t guest_write_generation(const void*, size_t) noexcept { return s_guestWriteGeneration; }
+} // namespace presentation
+
 uint64_t calc_texture_size(wgpu::TextureFormat format, uint32_t width, uint32_t height, uint32_t mips) noexcept {
   uint64_t total = 0;
   for (uint32_t mip = 0; mip < mips; ++mip) {
