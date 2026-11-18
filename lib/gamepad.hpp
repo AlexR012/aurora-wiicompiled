@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include "dolphin/pad.h" // For PADDeaZones and PADButtonMapping
 #include "SDL3/SDL_gamepad.h"
@@ -33,6 +34,8 @@ struct GameController {
   uint16_t m_rumbleIntensityHigh = 32767;
   bool m_forceDeviceRumble = false;
   bool m_mappingLoaded = false;
+  std::optional<std::string> m_mappingBaseline;
+  bool m_mappingNeedsFile = false;
   // SDL forgets the player index of devices mapped after connect; this keeps the assigned port.
   Sint32 m_playerIndex = -1;
   // Stable identity for telling identical controllers apart across launches.
