@@ -109,6 +109,20 @@ TEST_F(GXFifoTest, FifoPublishesOnlyAtExplicitBoundary) {
   EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
 }
 
+TEST_F(GXFifoTest, FloatPositionPreservesValuesOutsideIntegerRange) {
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXBegin(GX_POINTS, GX_VTXFMT0, 1);
+  const auto start = aurora::gx::fifo::get_buffer_size();
+  GXPosition3f32(std::bit_cast<float>(0x4f607182u), std::bit_cast<float>(0xcf607182u), -0.5f);
+  GXEnd();
+  const auto bytes = capture_fifo();
+  const std::vector<u8> expected{0x4f, 0x60, 0x71, 0x82, 0xcf, 0x60, 0x71, 0x82, 0xbf, 0x00, 0x00, 0x00};
+  ASSERT_EQ(bytes.size(), start + expected.size());
+  EXPECT_EQ(std::vector<u8>(bytes.begin() + start, bytes.end()), expected);
+}
+
 TEST_F(GXFifoTest, AutoSizedDrawPublishesAfterLengthPatch) {
   aurora::gx::fifo::init();
   aurora::gx::fifo::begin_frame();

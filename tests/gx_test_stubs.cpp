@@ -17,9 +17,11 @@
 #include "gx/pipeline.hpp"
 #include "gx/frame_interpolation.hpp"
 #include "gx/shader_info.hpp"
+#include "gx/texture.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
 
+#include <absl/container/flat_hash_map.h>
 #include <atomic>
 #include <cstdio>
 #include <fmt/format.h>
@@ -75,19 +77,37 @@ void configure(const GXRenderModeObj*) noexcept {}
 namespace aurora::gx {
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[id]; }
 namespace texture {
+namespace {
+absl::flat_hash_map<GXState::CopyTextureKey, GXState::CopyTextureRef> s_copyTextures;
+uint64_t s_copyFrame = 0;
+} // namespace
+
 void invalidate_bindings() noexcept {}
 void invalidate_sources() noexcept {}
 uint64_t current_bind_generation() noexcept { return 1; }
 GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept {
-  auto& ref = g_gxState.copyTextures[key.dest];
-  if (!ref.handle || ref.key != key) {
+  auto& ref = s_copyTextures[key];
+  if (!ref.handle) {
     ref.handle = std::make_shared<gfx::TextureRef>(wgpu::Texture{}, wgpu::TextureView{}, wgpu::TextureView{},
                                                    wgpu::Extent3D{key.width, key.height, 1},
                                                    wgpu::TextureFormat::RGBA8Unorm, 1, key.format);
+    ref.key = key;
   }
-  ref.key = key;
+  if (ref.revision == 0 || s_copyFrame - ref.producedFrame > 1) {
+    ref.consecutiveFrames = 0;
+  } else if (s_copyFrame != ref.producedFrame) {
+    ++ref.consecutiveFrames;
+  }
+  ref.producedFrame = s_copyFrame;
   ++ref.revision;
+  g_gxState.copyTextures[key.dest] = ref;
   return ref;
+}
+void end_frame() noexcept { ++s_copyFrame; }
+void shutdown() noexcept {
+  s_copyTextures.clear();
+  g_gxState.copyTextures.clear();
+  s_copyFrame = 0;
 }
 } // namespace texture
 void evict_texture_object(u32 texObjId) noexcept {
@@ -106,6 +126,7 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
 }
 void evict_copy_texture(const void* dest) noexcept {
   g_gxState.copyTextures.erase(dest);
+  absl::erase_if(texture::s_copyTextures, [dest](const auto& entry) { return entry.first.dest == dest; });
 }
 void shutdown() noexcept {}
 Vec2<uint32_t> logical_fb_size() noexcept { return {640, 480}; }
