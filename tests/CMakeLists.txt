@@ -196,6 +196,12 @@ if (AURORA_ENABLE_GX)
   target_link_libraries(lru_cache_tests PRIVATE gtest gtest_main absl::flat_hash_map)
   gtest_discover_tests(lru_cache_tests)
 
+  find_package(Threads REQUIRED)
+  add_executable(shader_module_cache_tests shader_module_cache_test.cpp)
+  target_include_directories(shader_module_cache_tests PRIVATE ../lib)
+  target_link_libraries(shader_module_cache_tests PRIVATE gtest gtest_main absl::flat_hash_map Threads::Threads)
+  gtest_discover_tests(shader_module_cache_tests PROPERTIES TIMEOUT 30)
+
   add_executable(texture_replacement_streaming_tests
     texture_replacement_streaming_test.cpp
   )

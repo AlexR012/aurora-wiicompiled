@@ -6,6 +6,7 @@
 #include "gx.hpp"
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
+#include "shader_module_cache.hpp"
 
 #include <dolphin/gx/GXEnum.h>
 
@@ -13,8 +14,6 @@
 #include <mutex>
 #include <string_view>
 #include <utility>
-#include <future>
-#include <unordered_map>
 
 #include "tracy/Tracy.hpp"
 
@@ -2319,13 +2318,13 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
 }
 
 namespace {
-std::mutex shaderModuleMutex;
-std::unordered_map<std::string, std::shared_future<wgpu::ShaderModule>> shaderModules;
+// Retain recent blend/depth variants without keeping every course's modules alive.
+constexpr size_t MaxCachedShaderModules = 1024;
+ShaderModuleCache<wgpu::ShaderModule> shaderModules{MaxCachedShaderModules};
 } // namespace
 
 void clear_shader_module_cache() {
   // Pipeline workers are joined before the device's modules are released.
-  std::lock_guard lock(shaderModuleMutex);
   shaderModules.clear();
 }
 
@@ -2342,37 +2341,18 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
   std::string key(reinterpret_cast<const char*>(&config), sizeof(config));
   key.append(reinterpret_cast<const char*>(&normalAttachment), sizeof(normalAttachment));
   key.append(reinterpret_cast<const char*>(&dstAlphaMode), sizeof(dstAlphaMode));
-  std::promise<wgpu::ShaderModule> promise;
-  std::shared_future<wgpu::ShaderModule> shared;
-  bool create = false;
-  {
-    std::lock_guard lock(shaderModuleMutex);
-    auto it = shaderModules.find(key);
-
-    if (it != shaderModules.end()) {
-      shared = it->second;
-    } else {
-      shared = promise.get_future().share();
-      shaderModules.emplace(key, shared);
-      create = true;
-    }
-  }
-
-  if (!create) {
-
-    return shared.get();
-  }
-  const auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
-  const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
-  wgpu::ShaderSourceWGSL wgslDescriptor{};
-  wgslDescriptor.code = shaderSource.c_str();
-  const auto label = fmt::format("GX Shader {:x}", hash);
-  const auto shaderDescriptor = wgpu::ShaderModuleDescriptor{
-      .nextInChain = &wgslDescriptor,
-      .label = label.c_str(),
-  };
-  auto result = webgpu::g_device.CreateShaderModule(&shaderDescriptor);
-  promise.set_value(result);
-  return result;
+  const auto shared = shaderModules.get_or_create(key, [&] {
+    const auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
+    const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
+    wgpu::ShaderSourceWGSL wgslDescriptor{};
+    wgslDescriptor.code = shaderSource.c_str();
+    const auto label = fmt::format("GX Shader {:x}", hash);
+    const auto shaderDescriptor = wgpu::ShaderModuleDescriptor{
+        .nextInChain = &wgslDescriptor,
+        .label = label.c_str(),
+    };
+    return webgpu::g_device.CreateShaderModule(&shaderDescriptor);
+  });
+  return shared.get();
 }
 } // namespace aurora::gx

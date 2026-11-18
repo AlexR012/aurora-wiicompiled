@@ -42,6 +42,7 @@ u32 GXEndDisplayList() {
   }
 
   __gx->inDispList = 0;
+  __GXInvalidateVtxState();
 
   return bytesWritten;
 }
@@ -59,6 +60,7 @@ void GXCallDisplayList(const void* data, u32 nbytes) {
 
   // Write display list contents to the FIFO
   aurora::gx::fifo::write_data(data, nbytes);
+  __GXInvalidateVtxState();
   aurora::gx::fifo::publish();
 }
 

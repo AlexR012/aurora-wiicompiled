@@ -15,6 +15,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <thread>
 
 using aurora::gx::g_gxState;
@@ -106,6 +107,20 @@ TEST_F(GXFifoTest, FifoPublishesOnlyAtExplicitBoundary) {
   aurora::gx::fifo::shutdown();
 
   EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
+}
+
+TEST_F(GXFifoTest, FloatPositionPreservesValuesOutsideIntegerRange) {
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXBegin(GX_POINTS, GX_VTXFMT0, 1);
+  const auto start = aurora::gx::fifo::get_buffer_size();
+  GXPosition3f32(std::bit_cast<float>(0x4f607182u), std::bit_cast<float>(0xcf607182u), -0.5f);
+  GXEnd();
+  const auto bytes = capture_fifo();
+  const std::vector<u8> expected{0x4f, 0x60, 0x71, 0x82, 0xcf, 0x60, 0x71, 0x82, 0xbf, 0x00, 0x00, 0x00};
+  ASSERT_EQ(bytes.size(), start + expected.size());
+  EXPECT_EQ(std::vector<u8>(bytes.begin() + start, bytes.end()), expected);
 }
 
 TEST_F(GXFifoTest, AutoSizedDrawPublishesAfterLengthPatch) {
@@ -1368,6 +1383,258 @@ TEST_F(GXFifoTest, GetVtxDesc_UsesShadowState) {
 }
 
 // --- GXSetVtxAttrFmt ---
+
+TEST_F(GXFifoTest, VtxState_UnchangedProducerStateSkipsPublicationBeforeDecode) {
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxDesc(GX_VA_TEX7, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX4, GX_TEX_ST, GX_S16, 11);
+  __GXSetDirtyState();
+  const auto size = aurora::gx::fifo::get_buffer_size();
+
+  for (int i = 0; i < 100; ++i) {
+    GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+    GXSetVtxDesc(GX_VA_TEX7, GX_DIRECT);
+    GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX4, GX_TEX_ST, GX_S16, 11);
+    EXPECT_EQ(__gx->dirtyState & 0x18, 0u);
+    EXPECT_EQ(__gx->dirtyVAT, 0u);
+    __GXSetDirtyState();
+  }
+  EXPECT_EQ(aurora::gx::fifo::get_buffer_size(), size);
+  decode_fifo(capture_fifo());
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_POS], GX_INDEX16);
+  EXPECT_EQ(g_gxState.vtxFmts[0].attrs[GX_VA_TEX4].frac, 11);
+}
+
+TEST_F(GXFifoTest, VtxState_PendingChangesRestoreOriginalValuesBeforeFlush) {
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT3, GX_VA_TEX4, GX_TEX_ST, GX_S16, 31);
+  __GXSetDirtyState();
+
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxAttrFmt(GX_VTXFMT3, GX_VA_TEX4, GX_TEX_S, GX_U8, 0);
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT3, GX_VA_TEX4, GX_TEX_ST, GX_S16, 31);
+  decode_fifo(flush_and_capture());
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_POS], GX_DIRECT);
+  const auto& fmt = g_gxState.vtxFmts[GX_VTXFMT3].attrs[GX_VA_TEX4];
+  EXPECT_EQ(fmt.cnt, GX_TEX_ST);
+  EXPECT_EQ(fmt.type, GX_S16);
+  EXPECT_EQ(fmt.frac, 31);
+}
+
+TEST_F(GXFifoTest, VtxState_EveryDescriptorSuppressesOnlyMatchingValues) {
+  GXClearVtxDesc();
+  for (int a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; ++a) {
+    const auto attr = static_cast<GXAttr>(a);
+    GXSetVtxDesc(attr, GX_DIRECT);
+    __GXSetDirtyState();
+    GXSetVtxDesc(attr, GX_DIRECT);
+    EXPECT_EQ(__gx->dirtyState & 8, 0u) << "attr=" << a;
+    GXSetVtxDesc(attr, a < GX_VA_POS ? GX_NONE : GX_INDEX16);
+    EXPECT_NE(__gx->dirtyState & 8, 0u) << "attr=" << a;
+    __GXSetDirtyState();
+  }
+  decode_fifo(capture_fifo());
+}
+
+TEST_F(GXFifoTest, VtxState_VectorSettersPreservePendingRestoration) {
+  GXVtxDescList descriptors[]{{GX_VA_POS, GX_DIRECT}, {GX_VA_TEX7, GX_INDEX8}, {GX_VA_NULL, GX_NONE}};
+  GXVtxAttrFmtList formats[]{{GX_VA_POS, GX_POS_XYZ, GX_F32, 0},
+                            {GX_VA_TEX4, GX_TEX_ST, GX_S16, 11},
+                            {GX_VA_NULL, GX_POS_XY, GX_U8, 0}};
+  GXSetVtxDescv(descriptors);
+  GXSetVtxAttrFmtv(GX_VTXFMT1, formats);
+  __GXSetDirtyState();
+  GXSetVtxDescv(descriptors);
+  GXSetVtxAttrFmtv(GX_VTXFMT1, formats);
+  EXPECT_EQ(__gx->dirtyState & 0x18, 0u);
+
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX4, GX_TEX_S, GX_U8, 0);
+  GXSetVtxDescv(descriptors);
+  GXSetVtxAttrFmtv(GX_VTXFMT1, formats);
+  decode_fifo(flush_and_capture());
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_POS], GX_DIRECT);
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_TEX7], GX_INDEX8);
+  EXPECT_EQ(g_gxState.vtxFmts[1].attrs[GX_VA_TEX4].frac, 11);
+}
+
+TEST_F(GXFifoTest, VtxState_RawCpWritesInvalidateProducerShadow) {
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxDesc(GX_VA_TEX7, GX_INDEX8);
+  GXSetVtxAttrFmt(GX_VTXFMT2, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT2, GX_VA_TEX4, GX_TEX_ST, GX_S16, 17);
+  __GXSetDirtyState();
+
+  GX_WRITE_CP_REG(0x50, 0);
+  GX_WRITE_CP_REG(0x60, 0);
+  GX_WRITE_CP_REG(0x72, 0);
+  GX_WRITE_CP_REG(0x82, 0);
+  GX_WRITE_CP_REG(0x92, 0);
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxDesc(GX_VA_TEX7, GX_INDEX8);
+  GXSetVtxAttrFmt(GX_VTXFMT2, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT2, GX_VA_TEX4, GX_TEX_ST, GX_S16, 17);
+  decode_fifo(flush_and_capture());
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_POS], GX_INDEX16);
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_TEX7], GX_INDEX8);
+  EXPECT_EQ(g_gxState.vtxFmts[2].attrs[GX_VA_POS].type, GX_F32);
+  EXPECT_EQ(g_gxState.vtxFmts[2].attrs[GX_VA_TEX4].frac, 17);
+}
+
+TEST_F(GXFifoTest, VtxState_EveryVatFieldAndRowSuppressesOnlyMatchingValues) {
+  for (int row = 0; row < GX_MAX_VTXFMT; ++row) {
+    const auto vtxfmt = static_cast<GXVtxFmt>(row);
+    for (int a = GX_VA_POS; a <= GX_VA_TEX7; ++a) {
+      const auto attr = static_cast<GXAttr>(a);
+      const bool color = attr == GX_VA_CLR0 || attr == GX_VA_CLR1;
+      const auto cnt = attr == GX_VA_NRM ? GX_NRM_NBT3 : color ? GX_CLR_RGBA : GX_TEX_ST;
+      const auto type = color ? GX_RGBA8 : GX_S16;
+      const u8 frac = static_cast<u8>((a + row) & 31);
+      GXSetVtxAttrFmt(vtxfmt, attr, cnt, type, frac);
+      __GXSetDirtyState();
+      const auto size = aurora::gx::fifo::get_buffer_size();
+      GXSetVtxAttrFmt(vtxfmt, attr, cnt, type, frac);
+      EXPECT_EQ(__gx->dirtyState & 0x10, 0u) << "attr=" << a << " row=" << row;
+      EXPECT_EQ(__gx->dirtyVAT, 0u);
+      __GXSetDirtyState();
+      EXPECT_EQ(aurora::gx::fifo::get_buffer_size(), size);
+
+      if (attr != GX_VA_NRM && !color) {
+        GXSetVtxAttrFmt(vtxfmt, attr, cnt, type, frac ^ 31);
+        EXPECT_NE(__gx->dirtyVAT & (1u << row), 0u);
+        __GXSetDirtyState();
+        GXSetVtxAttrFmt(vtxfmt, attr, GX_TEX_S, GX_U8, frac);
+        EXPECT_NE(__gx->dirtyVAT & (1u << row), 0u);
+        __GXSetDirtyState();
+      } else {
+        GXSetVtxAttrFmt(vtxfmt, attr, color ? GX_CLR_RGB : GX_NRM_XYZ, color ? GX_RGB565 : GX_S8, 0);
+        EXPECT_NE(__gx->dirtyVAT & (1u << row), 0u);
+        __GXSetDirtyState();
+      }
+    }
+  }
+  decode_fifo(capture_fifo());
+}
+
+TEST_F(GXFifoTest, VtxState_NormalAliasesRetainMetadataAndNbt3Bit) {
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_NBT, GX_INDEX16);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NBT, GX_NRM_NBT3, GX_S16, 0);
+  __GXSetDirtyState();
+  GXSetVtxDesc(GX_VA_NRM, GX_INDEX16);
+  GXSetVtxDesc(GX_VA_NBT, GX_NONE);
+  EXPECT_TRUE(__gx->hasNrms);
+  EXPECT_FALSE(__gx->hasBiNrms);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_S8, 0);
+  decode_fifo(flush_and_capture());
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_NRM], GX_INDEX16);
+  EXPECT_EQ(g_gxState.vtxFmts[0].attrs[GX_VA_NRM].cnt, GX_NRM_XYZ);
+  EXPECT_EQ(g_gxState.vtxFmts[0].attrs[GX_VA_NRM].type, GX_S8);
+
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NBT, GX_NRM_NBT3, GX_S16, 0);
+  decode_fifo(flush_and_capture());
+  EXPECT_EQ(g_gxState.vtxFmts[0].attrs[GX_VA_NRM].cnt, GX_NRM_NBT3);
+}
+
+TEST_F(GXFifoTest, VtxState_InvalidUnmaskedVatArgumentsStillUseSetterMasks) {
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_S8, 0);
+  __GXSetDirtyState();
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, static_cast<GXCompCnt>(2), GX_U8, 0);
+  decode_fifo(flush_and_capture());
+  EXPECT_EQ(g_gxState.vtxFmts[0].attrs[GX_VA_POS].cnt, GX_POS_XY);
+  EXPECT_EQ(g_gxState.vtxFmts[0].attrs[GX_VA_POS].type, GX_U8);
+}
+
+TEST_F(GXFifoTest, VtxState_DisplayListRecordingAndPlaybackInvalidateSentState) {
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  __GXSetDirtyState();
+  std::array<u8, 256> list{};
+  GXBeginDisplayList(list.data(), static_cast<u32>(list.size()));
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  const u32 size = GXEndDisplayList();
+  ASSERT_GT(size, 0u);
+  ASSERT_LE(size, list.size());
+  EXPECT_EQ(__gx->sentVcdValid, 0u);
+  EXPECT_EQ(__gx->sentVatValid, 0u);
+
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  __GXSetDirtyState();
+  GXCallDisplayList(list.data(), size);
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  decode_fifo(flush_and_capture());
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_POS], GX_DIRECT);
+  EXPECT_EQ(g_gxState.vtxFmts[0].attrs[GX_VA_POS].type, GX_F32);
+}
+
+TEST_F(GXFifoTest, VtxState_DiscardedFifoCannotLeaveValidSentState) {
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  __GXSetDirtyState();
+  aurora::gx::fifo::clear_buffer();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  EXPECT_NE(__gx->dirtyState & 8, 0u);
+  EXPECT_NE(__gx->dirtyVAT & 1, 0u);
+  decode_fifo(flush_and_capture());
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_POS], GX_INDEX16);
+}
+
+TEST_F(GXFifoTest, VtxState_NestedRecordedListsRestoreProducerStateOnNextSetter) {
+  GXClearVtxDesc();
+  __GXSetDirtyState();
+  std::array<u8, 256> child{};
+  GXBeginDisplayList(child.data(), static_cast<u32>(child.size()));
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  const u32 childSize = GXEndDisplayList();
+  ASSERT_LE(childSize, child.size());
+  std::array<u8, 512> parent{};
+  GXBeginDisplayList(parent.data(), static_cast<u32>(parent.size()));
+  GXCallDisplayList(child.data(), childSize);
+  const u32 parentSize = GXEndDisplayList();
+  ASSERT_LE(parentSize, parent.size());
+
+  GXCallDisplayList(parent.data(), parentSize);
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  decode_fifo(flush_and_capture());
+  EXPECT_EQ(g_gxState.vtxDesc[GX_VA_POS], GX_DIRECT);
+}
+
+TEST_F(GXFifoTest, VtxState_InitializationResetsSentValidity) {
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX16);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+  __GXSetDirtyState();
+  ASSERT_NE(__gx->sentVcdValid, 0u);
+  ASSERT_NE(__gx->sentVatValid & 1, 0u);
+  GXInit(nullptr, 0);
+  EXPECT_EQ(__gx->sentVcdValid, 0u);
+  EXPECT_EQ(__gx->sentVatValid, 0u);
+}
+
+TEST_F(GXFifoTest, DISABLED_VtxStatePublicationBenchmark) {
+  GXClearVtxDesc();
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < 200000; ++i) {
+    for (int attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; ++attr) {
+      GXSetVtxDesc(static_cast<GXAttr>(attr), attr >= GX_VA_POS ? GX_DIRECT : GX_NONE);
+    }
+    for (int attr = GX_VA_POS; attr <= GX_VA_TEX7; ++attr) {
+      GXSetVtxAttrFmt(GX_VTXFMT0, static_cast<GXAttr>(attr), GX_TEX_ST, GX_S16, 0);
+    }
+    __GXSetDirtyState();
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - start).count();
+  std::printf("publications=200000 elapsed_us=%lld fifo_bytes=%u\n", static_cast<long long>(elapsed),
+              aurora::gx::fifo::get_buffer_size());
+}
 
 TEST_F(GXFifoTest, VtxAttrFmt_PosF32) {
   GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);

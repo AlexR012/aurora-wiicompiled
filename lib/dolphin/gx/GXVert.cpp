@@ -57,7 +57,7 @@ struct Scalar {
 };
 
 static Scalar scalar_f32(float value) {
-  return Scalar{.kind = ScalarKind::Float, .f = value, .s = static_cast<int32_t>(value), .u = static_cast<uint32_t>(value)};
+  return Scalar{.kind = ScalarKind::Float, .f = value};
 }
 
 static Scalar scalar_u32(uint32_t value) {

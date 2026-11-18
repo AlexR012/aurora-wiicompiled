@@ -192,6 +192,15 @@ void copy_tex(const void* dest, GXBool clear, u32 copyControl) noexcept {
 } // namespace aurora::gx
 
 extern "C" {
+#if defined(MKW_GX_COPY_TESTING)
+void AuroraResetCopyProbesForTesting() {
+  for (const auto& [dest, stream] : sProbeStreams) {
+    AuroraReadbackDestroyStream(stream);
+  }
+  sProbeStreams.clear();
+}
+#endif
+
 GXRenderModeObj GXNtsc480IntDf = {
     VI_TVMODE_NTSC_INT,
     640,

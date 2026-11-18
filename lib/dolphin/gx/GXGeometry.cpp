@@ -2,6 +2,10 @@
 #include "__gx.h"
 #include "dolphin/gd/GDGeometry.h"
 
+namespace aurora::gx::fifo {
+void write_raw_draw_data(const uint8_t* data, uint32_t length) { write_data(data, length); }
+}
+
 static inline void SETVCDATTR(GXAttr attr, GXAttrType type) {
   switch (attr) {
   case GX_VA_PNMTXIDX:
@@ -152,16 +156,104 @@ static inline void SETVAT(u32* va, u32* vb, u32* vc, GXAttr attr, GXCompCnt cnt,
   }
 }
 
+static inline bool SentVtxDescMatches() {
+  return __gx->sentVcdValid && __gx->sentVcdLo == __gx->vcdLo && __gx->sentVcdHi == __gx->vcdHi &&
+         __gx->sentHasNrms == __gx->hasNrms && __gx->sentHasBiNrms == __gx->hasBiNrms &&
+         __gx->sentNrmType == __gx->nrmType;
+}
+
+static inline bool SDKVtxDescMatches(GXAttr attr, GXAttrType type) {
+  if (attr >= GX_VA_PNMTXIDX && attr < GX_VA_POS) {
+    return ((__gx->vcdLo >> attr) & 1u) == static_cast<u32>(type);
+  }
+  if (attr >= GX_VA_POS && attr <= GX_VA_CLR1 && attr != GX_VA_NRM) {
+    return ((__gx->vcdLo >> (9 + 2 * (attr - GX_VA_POS))) & 3u) == static_cast<u32>(type);
+  }
+  if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
+    return ((__gx->vcdHi >> (2 * (attr - GX_VA_TEX0))) & 3u) == static_cast<u32>(type);
+  }
+  return false;
+}
+
+static inline bool SentVtxAttrFmtMatches(GXVtxFmt fmt) {
+  return (__gx->sentVatValid & (1u << fmt)) != 0 && __gx->sentVatA[fmt] == __gx->vatA[fmt] &&
+         __gx->sentVatB[fmt] == __gx->vatB[fmt] && __gx->sentVatC[fmt] == __gx->vatC[fmt];
+}
+
+static inline bool SDKVtxAttrFmtMatches(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
+  if (static_cast<u32>(cnt) > 1u || static_cast<u32>(type) > 7u || frac > 31) {
+    return false;
+  }
+  const u32 format = static_cast<u32>(cnt) | (static_cast<u32>(type) << 1);
+  const u32 scaledFormat = format | (static_cast<u32>(frac) << 4);
+  switch (attr) {
+  case GX_VA_POS: return GET_REG_FIELD(__gx->vatA[fmt], 9, 0) == scaledFormat;
+  case GX_VA_CLR0: return GET_REG_FIELD(__gx->vatA[fmt], 4, 13) == format;
+  case GX_VA_CLR1: return GET_REG_FIELD(__gx->vatA[fmt], 4, 17) == format;
+  case GX_VA_TEX0: return GET_REG_FIELD(__gx->vatA[fmt], 9, 21) == scaledFormat;
+  case GX_VA_TEX1: return GET_REG_FIELD(__gx->vatB[fmt], 9, 0) == scaledFormat;
+  case GX_VA_TEX2: return GET_REG_FIELD(__gx->vatB[fmt], 9, 9) == scaledFormat;
+  case GX_VA_TEX3: return GET_REG_FIELD(__gx->vatB[fmt], 9, 18) == scaledFormat;
+  case GX_VA_TEX4:
+    return GET_REG_FIELD(__gx->vatB[fmt], 4, 27) == format && GET_REG_FIELD(__gx->vatC[fmt], 5, 0) == frac;
+  case GX_VA_TEX5: return GET_REG_FIELD(__gx->vatC[fmt], 9, 5) == scaledFormat;
+  case GX_VA_TEX6: return GET_REG_FIELD(__gx->vatC[fmt], 9, 14) == scaledFormat;
+  case GX_VA_TEX7: return GET_REG_FIELD(__gx->vatC[fmt], 9, 23) == scaledFormat;
+  default: return false;
+  }
+}
+
 extern "C" {
 
+void __GXRecordVtxDesc() {
+  if (aurora::gx::fifo::in_display_list()) {
+    return;
+  }
+  __gx->sentVcdLo = __gx->vcdLo;
+  __gx->sentVcdHi = __gx->vcdHi;
+  __gx->sentHasNrms = __gx->hasNrms;
+  __gx->sentHasBiNrms = __gx->hasBiNrms;
+  __gx->sentNrmType = __gx->nrmType;
+  __gx->sentVcdValid = 1;
+}
+
+void __GXRecordVtxAttrFmt(u8 fmt) {
+  if (aurora::gx::fifo::in_display_list()) {
+    return;
+  }
+  __gx->sentVatA[fmt] = __gx->vatA[fmt];
+  __gx->sentVatB[fmt] = __gx->vatB[fmt];
+  __gx->sentVatC[fmt] = __gx->vatC[fmt];
+  __gx->sentVatValid |= static_cast<u8>(1u << fmt);
+}
+
+void __GXInvalidateVtxState() {
+  __gx->sentVcdValid = 0;
+  __gx->sentVatValid = 0;
+}
+
+void __GXInvalidateVtxCPReg(u8 reg) {
+  if (reg == 0x50 || reg == 0x60) {
+    __gx->sentVcdValid = 0;
+  } else if (reg >= 0x70 && reg < 0x98 && (reg & 0xf) < GX_MAX_VTXFMT) {
+    __gx->sentVatValid &= static_cast<u8>(~(1u << (reg & 7)));
+  }
+}
+
 void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
+  const bool inDisplayList = aurora::gx::fifo::in_display_list();
+  if (!inDisplayList && SDKVtxDescMatches(attr, type) && SentVtxDescMatches()) {
+    return;
+  }
   SETVCDATTR(attr, type);
   if (__gx->hasNrms || __gx->hasBiNrms) {
     SET_REG_FIELD(0, __gx->vcdLo, 2, 11, __gx->nrmType);
   } else {
     SET_REG_FIELD(0, __gx->vcdLo, 2, 11, 0);
   }
-  __gx->dirtyState |= 8;
+  if (inDisplayList || !SentVtxDescMatches()) {
+    __gx->dirtyState |= 8;
+  }
 }
 
 void GXSetVtxDescv(GXVtxDescList* list) {
@@ -174,7 +266,9 @@ void GXSetVtxDescv(GXVtxDescList* list) {
   } else {
     SET_REG_FIELD(0, __gx->vcdLo, 2, 11, 0);
   }
-  __gx->dirtyState |= 8;
+  if (aurora::gx::fifo::in_display_list() || !SentVtxDescMatches()) {
+    __gx->dirtyState |= 8;
+  }
 }
 
 void GXClearVtxDesc() {
@@ -190,12 +284,19 @@ void GXSetVtxAttrFmt(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType typ
   CHECK(vtxfmt >= GX_VTXFMT0 && vtxfmt < GX_MAX_VTXFMT, "invalid vtxfmt {}", underlying(vtxfmt));
   CHECK(attr >= GX_VA_POS && attr < GX_VA_MAX_ATTR, "invalid attr {}", underlying(attr));
 
+  const bool inDisplayList = aurora::gx::fifo::in_display_list();
+  if (!inDisplayList && SDKVtxAttrFmtMatches(vtxfmt, attr, cnt, type, frac) && SentVtxAttrFmtMatches(vtxfmt)) {
+    return;
+  }
+
   u32* va = &__gx->vatA[vtxfmt];
   u32* vb = &__gx->vatB[vtxfmt];
   u32* vc = &__gx->vatC[vtxfmt];
   SETVAT(va, vb, vc, attr, cnt, type, frac);
-  __gx->dirtyState |= 0x10;
-  __gx->dirtyVAT |= static_cast<u8>(1 << vtxfmt);
+  if (inDisplayList || !SentVtxAttrFmtMatches(vtxfmt)) {
+    __gx->dirtyState |= 0x10;
+    __gx->dirtyVAT |= static_cast<u8>(1 << vtxfmt);
+  }
 }
 
 void GXSetVtxAttrFmtv(GXVtxFmt vtxfmt, const GXVtxAttrFmtList* list) {
@@ -211,8 +312,10 @@ void GXSetVtxAttrFmtv(GXVtxFmt vtxfmt, const GXVtxAttrFmtList* list) {
     ++list;
   }
 
-  __gx->dirtyState |= 0x10;
-  __gx->dirtyVAT |= static_cast<u8>(1 << vtxfmt);
+  if (aurora::gx::fifo::in_display_list() || !SentVtxAttrFmtMatches(vtxfmt)) {
+    __gx->dirtyState |= 0x10;
+    __gx->dirtyVAT |= static_cast<u8>(1 << vtxfmt);
+  }
 }
 
 void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
